@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Дикая Долина — 3D Сафари-Экосистема</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Playfair+Display:wght@600;700&display=swap"
+      rel="stylesheet"
+    />
+    <script type="module" crossorigin src="./assets/index-BUMc5vst.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-DSaJrNRo.css">
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="safari-canvas"></canvas>
+
+      <div id="hud" class="hud">
+        <!-- Top Bar -->
+        <header class="top-bar">
+          <div class="glass-pill brand-pill">
+            <span class="brand-dot" id="time-dot"></span>
+            <div class="brand-text">
+              <span class="brand-title">Дикая Долина</span>
+              <span class="brand-sub" id="clock-display">06:30 · Рассвет</span>
+            </div>
+          </div>
+
+          <div class="glass-pill env-pill" id="season-pill">
+            <span class="env-icon" id="season-icon">☀️</span>
+            <div class="env-meta">
+              <span id="season-label">Сухой сезон</span>
+              <span class="env-sub" id="weather-label">Ясно · Река мелеет</span>
+            </div>
+          </div>
+
+          <div class="glass-pill pop-pill" id="pop-toggle" title="Нажмите для сводки по видам">
+            <span class="pop-total" id="pop-total">🐾 90</span>
+            <span class="pop-hint">Экосистема</span>
+          </div>
+
+          <div class="controls-group">
+            <div class="glass-pill speed-pill" role="group" aria-label="Скорость времени">
+              <button class="icon-btn" data-speed="0" title="Пауза (Пробел)">⏸</button>
+              <button class="icon-btn active" data-speed="1" title="1x Созерцательный темп">1x</button>
+              <button class="icon-btn" data-speed="2" title="2x Ускоренный">2x</button>
+              <button class="icon-btn" data-speed="5" title="5x Быстрый">5x</button>
+            </div>
+
+            <button class="glass-btn" id="director-btn" title="Авторежиссёр: камера сама находит интересные сцены (D)">
+              🎬 <span>Авторежиссёр</span>
+            </button>
+
+            <button class="glass-btn" id="audio-btn" title="Природный звук (M)">
+              🔇 <span>Звук</span>
+            </button>
+
+            <button class="glass-btn icon-only" id="hide-hud-btn" title="Режим кинотеатра — скрыть интерфейс (H)">
+              👁
+            </button>
+          </div>
+        </header>
+
+        <!-- Species Breakdown Drawer (Collapsible) -->
+        <aside class="glass-card pop-drawer hidden" id="pop-drawer">
+          <div class="drawer-header">
+            <span>Популяция долины</span>
+            <span class="drawer-day" id="day-counter">День 1</span>
+          </div>
+          <div class="species-grid" id="species-grid"></div>
+        </aside>
+
+        <!-- Animal Documentary Card (Bottom Left) -->
+        <section class="glass-card inspector-card hidden" id="inspector-card">
+          <div class="inspector-top">
+            <div class="inspector-title-wrap">
+              <span class="inspector-emoji" id="insp-emoji">🦁</span>
+              <div>
+                <h2 class="inspector-name" id="insp-name">Зара</h2>
+                <p class="inspector-meta" id="insp-meta">Львица · Взрослая · 4.1 г.</p>
+              </div>
+            </div>
+            <button class="close-btn" id="insp-close" title="Отпустить камеру (Esc)">✕</button>
+          </div>
+
+          <div class="inspector-state">
+            <span class="state-badge" id="insp-state">Крадётся в высокой траве</span>
+            <span class="biome-badge" id="insp-biome">Саванна</span>
+          </div>
+
+          <div class="needs-bars">
+            <div class="need-row">
+              <span>Сытость</span>
+              <div class="bar-track"><div class="bar-fill hunger" id="bar-hunger"></div></div>
+            </div>
+            <div class="need-row">
+              <span>Жажда</span>
+              <div class="bar-track"><div class="bar-fill thirst" id="bar-thirst"></div></div>
+            </div>
+            <div class="need-row">
+              <span>Энергия</span>
+              <div class="bar-track"><div class="bar-fill energy" id="bar-energy"></div></div>
+            </div>
+            <div class="need-row">
+              <span>Здоровье</span>
+              <div class="bar-track"><div class="bar-fill health" id="bar-health"></div></div>
+            </div>
+          </div>
+
+          <p class="inspector-bio" id="insp-bio"></p>
+        </section>
+
+        <!-- Event Ticker (Bottom Right) -->
+        <div class="event-ticker" id="event-ticker"></div>
+
+        <!-- Subtle Controls Hint (Bottom Center) -->
+        <div class="controls-hint" id="controls-hint">
+          ЛКМ — вращение · ПКМ / WASD — перемещение · Колесо — зум · Клик по животному — следить
+        </div>
+      </div>
+
+      <!-- Cinema Mode Restore Button -->
+      <button class="cinema-restore hidden" id="show-hud-btn" title="Показать интерфейс (H)">
+        👁 Показать интерфейс (H)
+      </button>
+    </div>
+
+  </body>
+</html>
