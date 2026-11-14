@@ -1,45 +1,65 @@
-import * as THREE from 'three';
-import { Soundscape } from '../audio/Soundscape';
-import { animateAnimalRig, createAnimalRig } from '../entities/AnimalMeshFactory';
 import {
   SPECIES_CONFIGS,
   SPECIES_ORDER,
+  STAGE_ORDER,
+  STATE_ORDER,
   getSpeciesTitleRu,
   pickAnimalName,
-} from '../entities/SpeciesData';
-import type {
-  Animal,
-  Carcass,
-  SeasonState,
-  Sex,
-  SpeciesId,
-  TimeState,
-  TreeNode,
-  WorldEvent,
-} from '../types';
-import { Atmosphere } from '../world/Atmosphere';
+} from '../src/shared/SpeciesData.js';
 import {
   FORDS,
   WATERING_HOLES,
   WORLD_HALF,
   findNearestFordPoint,
-  getBiome,
   getGrassDensity,
   getRiverCenterX,
   getRiverHalfWidth,
   getTerrainHeight,
   getWaterDepth,
   getWaterLevel,
-} from '../world/TerrainMath';
-import { SpatialHash } from './SpatialHash';
+} from '../src/shared/TerrainMath.js';
+import { generateWorldLayout } from '../src/shared/WorldLayout.js';
+import type {
+  AnimalMeta,
+  AnimalTuple,
+  CarcassTuple,
+  SeasonState,
+  ServerTickMsg,
+  ServerWelcomeMsg,
+  Sex,
+  SimAnimal,
+  SimCarcass,
+  SpeciesId,
+  TimeState,
+  TreeNode,
+  Vec3,
+  WorldEvent,
+} from '../src/shared/types.js';
+import { SpatialHash, StaticColliderGrid } from './SpatialHash.js';
 
-const DAY_REAL_SECONDS = 180; // 3 real minutes = 1 full day at 1x speed
-const SEASON_CYCLE_DAYS = 4; // 12 real minutes per wet-dry cycle at 1x speed
+const DAY_REAL_SECONDS = 180;
+const SEASON_CYCLE_DAYS = 4;
 
-export class Simulation {
-  public readonly animals: Animal[] = [];
-  public readonly carcasses: Carcass[] = [];
-  public readonly events: WorldEvent[] = [];
+const SPECIES_IDX = new Map<SpeciesId, number>(SPECIES_ORDER.map((s, i) => [s, i]));
+const STATE_IDX = new Map<string, number>(STATE_ORDER.map((s, i) => [s, i]));
+const STAGE_IDX = new Map<string, number>(STAGE_ORDER.map((s, i) => [s, i]));
+
+export interface PersistedWorld {
+  totalSimDays: number;
+  nextAnimalId: number;
+  nextCarcassId: number;
+  nextEventId: number;
+  seasonProgress: number;
+  rainCooldown: number;
+  rainRemaining: number;
+  animals: SimAnimal[];
+  carcasses: SimCarcass[];
+}
+
+export class SimulationCore {
+  public animals: SimAnimal[] = [];
+  public carcasses: SimCarcass[] = [];
+  public events: WorldEvent[] = [];
 
   public timeState: TimeState = {
     day: 1,
@@ -63,54 +83,154 @@ export class Simulation {
   private nextAnimalId = 1;
   private nextCarcassId = 1;
   private nextEventId = 1;
-
   private totalSimDays = 6.4 / 24;
   private rainCooldown = 45;
   private rainRemaining = 0;
-  private migrationCheckTimer = 6;
+  private migrationCheckTimer = 8;
   private foliageRegenTimer = 0;
   private prevWetSeasonFlag = true;
 
-  private readonly spatial = new SpatialHash(20);
-  private readonly animalRootGroup = new THREE.Group();
-  private readonly carcassGroup = new THREE.Group();
   private readonly trees: TreeNode[];
-  private readonly kopjes: THREE.Vector3[];
-  private readonly atmosphere: Atmosphere;
-  private readonly soundscape: Soundscape;
+  private readonly kopjes: Vec3[];
+  private readonly colliderGrid: StaticColliderGrid;
+  private readonly spatial = new SpatialHash(20);
 
-  private cameraTargetRef = new THREE.Vector3();
+  // Per-tick delta tracking
+  private pendingAdded: AnimalMeta[] = [];
+  private pendingRemoved: number[] = [];
+  private pendingEvents: WorldEvent[] = [];
+  private lastBroadcastStatuses = new Map<number, string>();
 
-  constructor(
-    scene: THREE.Scene,
-    trees: TreeNode[],
-    kopjes: THREE.Vector3[],
-    atmosphere: Atmosphere,
-    soundscape: Soundscape
-  ) {
-    this.trees = trees;
-    this.kopjes = kopjes;
-    this.atmosphere = atmosphere;
-    this.soundscape = soundscape;
+  constructor(persisted?: PersistedWorld | null) {
+    const layout = generateWorldLayout();
+    this.trees = layout.trees;
+    this.kopjes = layout.kopjes;
+    this.colliderGrid = new StaticColliderGrid(layout.colliders);
 
-    scene.add(this.animalRootGroup);
-    scene.add(this.carcassGroup);
+    if (persisted && persisted.animals.length > 0) {
+      this.totalSimDays = persisted.totalSimDays;
+      this.nextAnimalId = persisted.nextAnimalId;
+      this.nextCarcassId = persisted.nextCarcassId;
+      this.nextEventId = persisted.nextEventId;
+      this.rainCooldown = persisted.rainCooldown ?? 40;
+      this.rainRemaining = persisted.rainRemaining ?? 0;
+      this.animals = persisted.animals;
+      this.carcasses = persisted.carcasses ?? [];
+      this.updateTimeAndSeason(0, 0);
+      this.prevWetSeasonFlag = !this.season.isDrySeason;
+    } else {
+      this.populateInitialValley();
+      this.updateTimeAndSeason(0, 0);
+    }
 
-    this.populateInitialValley();
-    this.updateTimeAndSeason(0);
+    for (const a of this.animals) {
+      this.lastBroadcastStatuses.set(a.id, a.statusText);
+    }
   }
 
-  public setCameraTarget(target: THREE.Vector3): void {
-    this.cameraTargetRef.copy(target);
+  public exportSnapshotForDisk(): PersistedWorld {
+    return {
+      totalSimDays: this.totalSimDays,
+      nextAnimalId: this.nextAnimalId,
+      nextCarcassId: this.nextCarcassId,
+      nextEventId: this.nextEventId,
+      seasonProgress: this.season.progress,
+      rainCooldown: this.rainCooldown,
+      rainRemaining: this.rainRemaining,
+      animals: this.animals,
+      carcasses: this.carcasses,
+    };
+  }
+
+  public buildWelcomeMsg(viewerCount: number): ServerWelcomeMsg {
+    return {
+      type: 'welcome',
+      t: this.timeState,
+      s: this.season,
+      v: viewerCount,
+      meta: this.animals.map((a) => this.toMeta(a)),
+      a: this.animals.map((a) => this.toTuple(a)),
+      c: this.carcasses.map((c) => this.toCarcassTuple(c)),
+      events: this.events.slice(0, 6),
+    };
+  }
+
+  public consumeTickMsg(viewerCount: number): ServerTickMsg {
+    const statuses: [number, string][] = [];
+    for (const a of this.animals) {
+      if (this.lastBroadcastStatuses.get(a.id) !== a.statusText) {
+        statuses.push([a.id, a.statusText]);
+        this.lastBroadcastStatuses.set(a.id, a.statusText);
+      }
+    }
+
+    const msg: ServerTickMsg = {
+      type: 'tick',
+      t: this.timeState,
+      s: this.season,
+      v: viewerCount,
+      a: this.animals.map((a) => this.toTuple(a)),
+      c: this.carcasses.map((c) => this.toCarcassTuple(c)),
+    };
+
+    if (this.pendingAdded.length > 0) msg.added = this.pendingAdded.splice(0);
+    if (this.pendingRemoved.length > 0) msg.removed = this.pendingRemoved.splice(0);
+    if (statuses.length > 0) msg.statuses = statuses;
+    if (this.pendingEvents.length > 0) msg.events = this.pendingEvents.splice(0);
+
+    return msg;
+  }
+
+  private toMeta(a: SimAnimal): AnimalMeta {
+    return {
+      id: a.id,
+      species: a.species,
+      name: a.name,
+      sex: a.sex,
+      groupId: a.groupId,
+      maxAgeDays: Number(a.maxAgeDays.toFixed(1)),
+      statusText: a.statusText,
+    };
+  }
+
+  private toTuple(a: SimAnimal): AnimalTuple {
+    const flags = (a.isSwimming ? 1 : 0) | (a.yawnTimer > 0 ? 2 : 0);
+    return [
+      a.id,
+      Number(a.pos.x.toFixed(2)),
+      Number(a.pos.y.toFixed(2)),
+      Number(a.pos.z.toFixed(2)),
+      Number(a.yaw.toFixed(3)),
+      Number(a.speed.toFixed(2)),
+      STATE_IDX.get(a.state) ?? 0,
+      Math.round(a.hunger),
+      Math.round(a.thirst),
+      Math.round(a.energy),
+      Math.round(a.health),
+      Number(a.ageDays.toFixed(1)),
+      STAGE_IDX.get(a.stage) ?? 1,
+      flags,
+    ];
+  }
+
+  private toCarcassTuple(c: SimCarcass): CarcassTuple {
+    return [
+      c.id,
+      SPECIES_IDX.get(c.species) ?? 0,
+      Number(c.pos.x.toFixed(2)),
+      Number(c.pos.y.toFixed(2)),
+      Number(c.pos.z.toFixed(2)),
+      Number(c.yaw.toFixed(3)),
+      Number((c.meatRemaining / c.maxMeat).toFixed(2)),
+      c.isJuvenile ? 1 : 0,
+    ];
   }
 
   private populateInitialValley(): void {
-    // 1. Elephants (7: 1 matriarch herd of 5 + 2 roaming bulls)
     this.spawnGroup('elephant', -64, -28, 5, 1, 2);
     this.spawnAnimal('elephant', -68, 38, 'M', 'adult', 2);
     this.spawnAnimal('elephant', -36, 62, 'M', 'adult', 3);
 
-    // 2. Lions (8: 1 savanna pride near central kopje + 1 nomadic male)
     this.spawnAnimal('lion', -47, -9, 'M', 'adult', 10);
     for (let i = 0; i < 4; i++) {
       this.spawnAnimal('lion', -49 + (i - 1.5) * 3, -6 + (i % 2) * 3, 'F', 'adult', 10);
@@ -119,45 +239,34 @@ export class Simulation {
     this.spawnAnimal('lion', -50, -10, 'M', 'juvenile', 10);
     this.spawnAnimal('lion', -74, -58, 'M', 'adult', 11);
 
-    // 3. Tigers (4: solitary territories across jungle side)
     this.spawnAnimal('tiger', 52, -60, 'M', 'adult', 20);
     this.spawnAnimal('tiger', 44, 6, 'F', 'adult', 21);
     this.spawnAnimal('tiger', 47, 11, 'M', 'juvenile', 21);
     this.spawnAnimal('tiger', 56, 64, 'M', 'adult', 22);
 
-    // 4. Giraffes (8: 2 savanna towers)
     this.spawnGroup('giraffe', -56, -46, 4, 30, 1);
     this.spawnGroup('giraffe', -48, 44, 4, 31, 1);
 
-    // 5. Hippos (10: 2 pods directly inside wide river lagoons)
     const hippoZ1 = -24;
-    const hippoX1 = getRiverCenterX(hippoZ1);
-    this.spawnGroup('hippo', hippoX1, hippoZ1, 5, 40, 1);
-
+    this.spawnGroup('hippo', getRiverCenterX(hippoZ1), hippoZ1, 5, 40, 1);
     const hippoZ2 = 38;
-    const hippoX2 = getRiverCenterX(hippoZ2);
-    this.spawnGroup('hippo', hippoX2, hippoZ2, 5, 41, 1);
+    this.spawnGroup('hippo', getRiverCenterX(hippoZ2), hippoZ2, 5, 41, 1);
 
-    // 6. Zebras (19: 2 savanna herds)
     this.spawnGroup('zebra', -32, -38, 10, 50, 2);
     this.spawnGroup('zebra', -60, 32, 9, 51, 2);
 
-    // 7. Antelopes (19: 3 savanna herds)
     this.spawnGroup('antelope', -38, 12, 7, 60, 1);
     this.spawnGroup('antelope', -76, -16, 6, 61, 1);
     this.spawnGroup('antelope', -34, -76, 6, 62, 1);
 
-    // 8. Jungle Deer (12: 3 jungle groups)
     this.spawnGroup('deer', 36, -34, 4, 70, 1);
     this.spawnGroup('deer', 54, 30, 4, 71, 1);
     this.spawnGroup('deer', 32, 72, 4, 72, 1);
 
-    // 9. Wild Boars (9: 3 sounders in jungle thickets)
     this.spawnGroup('boar', 68, -22, 3, 80, 1);
     this.spawnGroup('boar', 42, -74, 3, 81, 1);
     this.spawnGroup('boar', 64, 46, 3, 82, 1);
 
-    // 10. Vultures (7: soaring overhead)
     for (let i = 0; i < 7; i++) {
       this.spawnAnimal(
         'vulture',
@@ -171,8 +280,8 @@ export class Simulation {
 
     this.pushEvent(
       '🌅',
-      'Рассвет над долиной: стада выходят на пастбища, хищники начинают обход',
-      new THREE.Vector3(0, 0, 0),
+      'Рассвет над долиной: единая экосистема оживает',
+      { x: 0, y: 0, z: 0 },
       2
     );
   }
@@ -187,7 +296,7 @@ export class Simulation {
   ): void {
     for (let i = 0; i < count; i++) {
       const ang = (i / count) * Math.PI * 2 + Math.random() * 0.5;
-      const dist = i === 0 ? 0 : 2.5 + Math.random() * 5.5;
+      const dist = i === 0 ? 0 : 2.8 + Math.random() * 5.2;
       const x = cx + Math.cos(ang) * dist;
       const z = cz + Math.sin(ang) * dist;
       const sex: Sex = i === 0 ? 'F' : Math.random() < 0.45 ? 'M' : 'F';
@@ -204,28 +313,21 @@ export class Simulation {
     stage: 'juvenile' | 'adult',
     groupId: number,
     motherId: number | null = null
-  ): Animal {
+  ): SimAnimal {
     const cfg = SPECIES_CONFIGS[species];
     const id = this.nextAnimalId++;
     const name = pickAnimalName(species, sex, id);
-
-    const rig = createAnimalRig(species, sex);
-    rig.root.userData.animalId = id;
-    rig.root.traverse((obj) => {
-      obj.userData.animalId = id;
-    });
-
     const ageDays =
       stage === 'juvenile'
         ? cfg.lifespanDays * (0.04 + Math.random() * 0.1)
         : cfg.lifespanDays * (0.28 + Math.random() * 0.42);
 
-    const clampedX = Math.max(-WORLD_HALF + 2, Math.min(WORLD_HALF - 2, x));
-    const clampedZ = Math.max(-WORLD_HALF + 2, Math.min(WORLD_HALF - 2, z));
-    const y = getTerrainHeight(clampedX, clampedZ);
-    const soarHeight = species === 'vulture' ? 18 + Math.random() * 12 : 0;
+    const cx = Math.max(-WORLD_HALF + 3, Math.min(WORLD_HALF - 3, x));
+    const cz = Math.max(-WORLD_HALF + 3, Math.min(WORLD_HALF - 3, z));
+    const groundY = getTerrainHeight(cx, cz);
+    const soarHeight = species === 'vulture' ? 22 + Math.random() * 11 : 0;
 
-    const animal: Animal = {
+    const animal: SimAnimal = {
       id,
       species,
       name,
@@ -235,18 +337,14 @@ export class Simulation {
       stage,
       groupId,
       motherId,
-
-      pos: new THREE.Vector3(clampedX, species === 'vulture' ? y + soarHeight : y, clampedZ),
-      vel: new THREE.Vector3(),
+      pos: { x: cx, y: species === 'vulture' ? Math.max(groundY, 0) + soarHeight : groundY, z: cz },
       yaw: Math.random() * Math.PI * 2,
       speed: 0,
       isSwimming: false,
-
       hunger: 68 + Math.random() * 26,
       thirst: 68 + Math.random() * 26,
       energy: 72 + Math.random() * 25,
       health: 95 + Math.random() * 5,
-
       state: species === 'vulture' ? 'soaring' : 'wandering',
       statusText: species === 'vulture' ? 'Парит в потоках воздуха' : 'Осматривает долину',
       stateTimer: 2 + Math.random() * 4,
@@ -255,35 +353,29 @@ export class Simulation {
       attackCooldown: 0,
       callCooldown: 6 + Math.random() * 14,
       yawnTimer: 0,
-
       targetPos: null,
       targetAnimalId: null,
       targetCarcassId: null,
       targetTreeIdx: null,
       threatAnimalId: null,
-      homeCenter: new THREE.Vector3(clampedX, 0, clampedZ),
-
-      gaitPhase: Math.random() * Math.PI * 2,
-      restBlend: 0,
-      drinkBlend: 0,
-      browseBlend: 0,
-      stalkBlend: 0,
-      swimBlend: 0,
+      homeCenter: { x: cx, y: 0, z: cz },
       soarHeight,
       soarAngle: Math.random() * Math.PI * 2,
-
-      rig,
       alive: true,
     };
 
-    rig.root.position.copy(animal.pos);
-    rig.root.rotation.y = animal.yaw;
-    this.animalRootGroup.add(rig.root);
+    if (species !== 'vulture') {
+      this.resolveStaticCollisions(animal);
+      animal.pos.y = getTerrainHeight(animal.pos.x, animal.pos.z);
+    }
+
     this.animals.push(animal);
+    this.pendingAdded.push(this.toMeta(animal));
+    this.lastBroadcastStatuses.set(animal.id, animal.statusText);
     return animal;
   }
 
-  public getAnimalById(id: number | null): Animal | null {
+  public getAnimalById(id: number | null): SimAnimal | null {
     if (id === null) return null;
     for (let i = 0; i < this.animals.length; i++) {
       if (this.animals[i].id === id && this.animals[i].alive) return this.animals[i];
@@ -300,51 +392,44 @@ export class Simulation {
     return counts;
   }
 
-  public step(realDt: number, timeSpeed: number, realTime: number): void {
-    const simRealDt = Math.min(0.1, realDt) * timeSpeed;
-    if (simRealDt <= 0) {
-      // Even when paused, gently update nothing or subtle idle? Let's freeze simulation cleanly on pause.
-      return;
-    }
+  public step(simDt: number): void {
+    const dt = Math.min(0.25, simDt);
+    if (dt <= 0) return;
 
-    const simDaysDt = simRealDt / DAY_REAL_SECONDS;
-    this.updateTimeAndSeason(simDaysDt, simRealDt);
+    const simDaysDt = dt / DAY_REAL_SECONDS;
+    this.updateTimeAndSeason(simDaysDt, dt);
 
-    // Rebuild spatial grid
     this.spatial.clear();
     for (let i = 0; i < this.animals.length; i++) {
       if (this.animals[i].alive) this.spatial.insert(this.animals[i]);
     }
 
-    // Regenerate tree foliage gradually (faster in wet season)
-    this.foliageRegenTimer += simRealDt;
+    this.foliageRegenTimer += dt;
     if (this.foliageRegenTimer > 2.5) {
       const regen = (0.015 + this.season.wetness * 0.04) * (this.foliageRegenTimer / 2.5);
       for (let i = 0; i < this.trees.length; i++) {
-        this.trees[i].foliage = Math.min(1, this.trees[i].foliage + regen);
+        if (this.trees[i].kind !== 'snag') {
+          this.trees[i].foliage = Math.min(1, this.trees[i].foliage + regen);
+        }
       }
       this.foliageRegenTimer = 0;
     }
 
-    // Update all animals
     const counts = this.getSpeciesCounts();
     for (let i = 0; i < this.animals.length; i++) {
       const a = this.animals[i];
       if (!a.alive) continue;
-      this.updateAnimal(a, simRealDt, simDaysDt, realDt, realTime, counts);
+      this.updateAnimal(a, dt, simDaysDt, counts);
     }
 
-    // Update carcasses & clean expired
-    this.updateCarcasses(simRealDt);
+    this.updateCarcasses(dt);
 
-    // Check migration safeguard so ecosystem never empties
-    this.migrationCheckTimer -= simRealDt;
+    this.migrationCheckTimer -= dt;
     if (this.migrationCheckTimer <= 0) {
-      this.migrationCheckTimer = 14;
+      this.migrationCheckTimer = 9;
       this.checkNaturalMigration(counts);
     }
 
-    // Prune dead animal objects cleanly
     for (let i = this.animals.length - 1; i >= 0; i--) {
       if (!this.animals[i].alive) {
         this.animals.splice(i, 1);
@@ -352,7 +437,7 @@ export class Simulation {
     }
   }
 
-  private updateTimeAndSeason(simDaysDt: number, simRealDt = 0): void {
+  private updateTimeAndSeason(simDaysDt: number, simDt: number): void {
     this.totalSimDays += simDaysDt;
     const day = Math.floor(this.totalSimDays) + 1;
     const tod = this.totalSimDays % 1;
@@ -368,22 +453,13 @@ export class Simulation {
     else if (exactHour >= 18.5 && exactHour < 20.8) phaseNameRu = 'Закат и сумерки';
     else phaseNameRu = 'Звёздная ночь';
 
-    // Temperature peaks ~14:00 (tod ~ 0.58), lowest ~04:00
     const sunCurve = Math.sin((tod - 0.32) * Math.PI * 2) * 0.5 + 0.5;
     const seasonHeatBoost = (1 - this.season.wetness) * 0.16;
     const rainCool = this.season.rainIntensity * 0.25;
     const temperature = Math.max(0.08, Math.min(1, sunCurve * 0.85 + seasonHeatBoost - rainCool));
 
-    this.timeState = {
-      day,
-      timeOfDay: tod,
-      hour,
-      minute,
-      phaseNameRu,
-      temperature,
-    };
+    this.timeState = { day, timeOfDay: tod, hour, minute, phaseNameRu, temperature };
 
-    // Season cycle
     const progress = (this.totalSimDays / SEASON_CYCLE_DAYS) % 1;
     const wetness = 0.5 + 0.5 * Math.sin(progress * Math.PI * 2);
     const isDrySeason = wetness < 0.48;
@@ -393,7 +469,7 @@ export class Simulation {
       this.pushEvent(
         '☀️',
         'Наступает сухой сезон: река мелеет и открываются широкие броды',
-        new THREE.Vector3(getRiverCenterX(8), 0, 8),
+        { x: getRiverCenterX(8), y: 0, z: 8 },
         2
       );
     } else if (!isDrySeason && !this.prevWetSeasonFlag) {
@@ -401,19 +477,18 @@ export class Simulation {
       this.pushEvent(
         '🌧️',
         'Приходит сезон дождей: долина зеленеет, водопои наполняются водой',
-        new THREE.Vector3(-60, 0, 15),
+        { x: -60, y: 0, z: 15 },
         2
       );
     }
 
-    // Dynamic rainfall during wet / transitional seasons
-    if (simRealDt > 0) {
+    if (simDt > 0) {
       if (this.rainRemaining > 0) {
-        this.rainRemaining -= simRealDt;
-        this.season.rainIntensity = Math.min(1, this.season.rainIntensity + simRealDt * 0.25);
+        this.rainRemaining -= simDt;
+        this.season.rainIntensity = Math.min(1, this.season.rainIntensity + simDt * 0.25);
       } else {
-        this.season.rainIntensity = Math.max(0, this.season.rainIntensity - simRealDt * 0.22);
-        this.rainCooldown -= simRealDt * (0.4 + wetness * 1.1);
+        this.season.rainIntensity = Math.max(0, this.season.rainIntensity - simDt * 0.22);
+        this.rainCooldown -= simDt * (0.4 + wetness * 1.1);
         if (this.rainCooldown <= 0) {
           this.rainCooldown = 50 + Math.random() * 65;
           if (wetness > 0.38 && Math.random() < 0.25 + wetness * 0.65) {
@@ -425,34 +500,33 @@ export class Simulation {
 
     const isRaining = this.season.rainIntensity > 0.25;
     const seasonNameRu = isDrySeason ? 'Сухой сезон' : 'Сезон дождей';
-    let weatherTextRu = '';
-    if (isRaining) {
-      weatherTextRu = 'Тропический ливень';
-    } else if (isDrySeason) {
-      weatherTextRu = wetness < 0.25 ? 'Засуха · Броды открыты' : 'Жарко · Река мелеет';
-    } else {
-      weatherTextRu = 'Тепло · Полноводная река';
-    }
+    const weatherTextRu = isRaining
+      ? 'Тропический ливень'
+      : isDrySeason
+        ? wetness < 0.25
+          ? 'Засуха · Броды открыты'
+          : 'Жарко · Река мелеет'
+        : 'Тепло · Полноводная река';
 
-    this.season.progress = progress;
-    this.season.wetness = wetness;
-    this.season.isDrySeason = isDrySeason;
-    this.season.isRaining = isRaining;
-    this.season.seasonNameRu = seasonNameRu;
-    this.season.weatherTextRu = weatherTextRu;
+    this.season = {
+      progress,
+      wetness,
+      isDrySeason,
+      isRaining,
+      rainIntensity: this.season.rainIntensity,
+      seasonNameRu,
+      weatherTextRu,
+    };
   }
 
   private updateAnimal(
-    a: Animal,
+    a: SimAnimal,
     simDt: number,
     simDaysDt: number,
-    realDt: number,
-    realTime: number,
     counts: Record<SpeciesId, number>
   ): void {
     const cfg = SPECIES_CONFIGS[a.species];
 
-    // 1. Aging & Lifecycle
     a.ageDays += simDaysDt;
     if (a.stage === 'juvenile' && a.ageDays >= a.maxAgeDays * cfg.maturityAgeRatio) {
       a.stage = 'adult';
@@ -470,23 +544,22 @@ export class Simulation {
     }
 
     if (a.ageDays >= a.maxAgeDays) {
-      this.killAnimal(a, 'от старости');
+      this.killAnimal(a);
       return;
     }
 
-    // 2. Physiology ticks
     const activeFactor =
       a.state === 'chasing' || a.state === 'fleeing' || a.state === 'defending'
         ? 2.2
-        : a.state === 'resting'
+        : a.state === 'resting' || a.state === 'perching'
           ? 0.45
           : 1.0;
 
-    a.hunger = Math.max(0, a.hunger - simDt * 0.42 * activeFactor);
+    a.hunger = Math.max(0, a.hunger - simDt * 0.4 * activeFactor);
     const heatThirstMult = 0.75 + this.timeState.temperature * 0.9 + (1 - this.season.wetness) * 0.35;
-    a.thirst = Math.max(0, a.thirst - simDt * 0.46 * heatThirstMult);
+    a.thirst = Math.max(0, a.thirst - simDt * 0.44 * heatThirstMult);
 
-    if (a.state === 'resting') {
+    if (a.state === 'resting' || a.state === 'perching') {
       a.energy = Math.min(100, a.energy + simDt * 4.4);
     } else if (a.state === 'chasing' || a.state === 'fleeing') {
       a.energy = Math.max(0, a.energy - simDt * 3.8);
@@ -499,7 +572,7 @@ export class Simulation {
     } else if (a.hunger <= 2 || a.thirst <= 2) {
       a.health -= simDt * 1.4;
       if (a.health <= 0) {
-        this.killAnimal(a, a.thirst <= 2 ? 'от обезвоживания' : 'от голода');
+        this.killAnimal(a);
         return;
       }
     }
@@ -508,21 +581,6 @@ export class Simulation {
     if (a.attackCooldown > 0) a.attackCooldown = Math.max(0, a.attackCooldown - simDt);
     if (a.yawnTimer > 0) a.yawnTimer = Math.max(0, a.yawnTimer - simDt);
 
-    // Periodic ambient animal calls
-    a.callCooldown -= simDt;
-    if (a.callCooldown <= 0) {
-      a.callCooldown = 14 + Math.random() * 26;
-      if (
-        (a.species === 'lion' && (this.timeState.hour < 7 || this.timeState.hour > 17)) ||
-        (a.species === 'elephant' && a.state === 'defending') ||
-        (a.species === 'hippo' && a.isSwimming) ||
-        (a.species === 'tiger' && a.state === 'chasing')
-      ) {
-        this.soundscape.playAnimalCall(a.species, a.pos, this.cameraTargetRef);
-      }
-    }
-
-    // 3. Decision making
     a.stateTimer -= simDt;
     a.decisionCooldown -= simDt;
 
@@ -530,40 +588,34 @@ export class Simulation {
 
     if (a.decisionCooldown <= 0) {
       a.decisionCooldown =
-        a.state === 'chasing' || a.state === 'fleeing' || a.state === 'defending' ? 0.25 : 0.75 + Math.random() * 0.45;
+        a.state === 'chasing' || a.state === 'fleeing' || a.state === 'defending'
+          ? 0.25
+          : 0.75 + Math.random() * 0.45;
       this.decideBehavior(a, neighbors, counts);
     }
 
-    // 4. Execute movement & state action
     this.executeState(a, simDt, neighbors, counts);
-
-    // 5. Animate 3D mesh
-    const waterDepth = a.species === 'vulture' ? 0 : getWaterDepth(a.pos.x, a.pos.z, this.season.wetness);
-    animateAnimalRig(a, realDt, simDt, realTime, waterDepth);
   }
 
   private decideBehavior(
-    a: Animal,
-    neighbors: Animal[],
+    a: SimAnimal,
+    neighbors: SimAnimal[],
     counts: Record<SpeciesId, number>
   ): void {
     const cfg = SPECIES_CONFIGS[a.species];
 
-    // Vultures have specialized aerial/scavenger logic
     if (a.species === 'vulture') {
       this.decideVultureBehavior(a, neighbors);
       return;
     }
 
-    // 1. Check immediate predators / threats for herbivores & juveniles
     if (cfg.diet !== 'carnivore' || a.stage === 'juvenile') {
       const threat = this.findNearestThreat(a, neighbors);
       if (threat) {
-        // Adult elephants & adult hippos & adult giraffes (if cornered) defend!
-        const dist = a.pos.distanceTo(threat.pos);
+        const dist = dist3(a.pos, threat.pos);
         if (a.species === 'elephant' && a.stage !== 'juvenile') {
           const nearCalf = neighbors.some(
-            (n) => n.species === 'elephant' && n.stage === 'juvenile' && n.pos.distanceTo(threat.pos) < 12
+            (n) => n.species === 'elephant' && n.stage === 'juvenile' && dist3(n.pos, threat.pos) < 12
           );
           if (
             threat.state === 'chasing' ||
@@ -593,12 +645,11 @@ export class Simulation {
       }
     }
 
-    // 2. Territorial defense for Hippos near water & Lions/Tigers
     if (a.species === 'hippo' && a.stage !== 'juvenile') {
       const intruder = neighbors.find(
         (n) =>
           (n.species === 'lion' || n.species === 'tiger') &&
-          a.pos.distanceTo(n.pos) < 12 &&
+          dist3(a.pos, n.pos) < 12 &&
           getWaterDepth(n.pos.x, n.pos.z, this.season.wetness) > 0.05
       );
       if (intruder) {
@@ -613,8 +664,8 @@ export class Simulation {
     if (a.species === 'lion' && a.sex === 'M' && a.stage !== 'juvenile') {
       const rival = neighbors.find(
         (n) =>
-          ((n.species === 'tiger' && a.pos.distanceTo(n.pos) < 16) ||
-            (n.species === 'lion' && n.sex === 'M' && n.groupId !== a.groupId && a.pos.distanceTo(n.pos) < 16))
+          (n.species === 'tiger' && dist3(a.pos, n.pos) < 15) ||
+          (n.species === 'lion' && n.sex === 'M' && n.groupId !== a.groupId && dist3(a.pos, n.pos) < 15)
       );
       if (rival) {
         this.enterDefend(a, rival, 'Охраняет границы прайда!');
@@ -629,7 +680,7 @@ export class Simulation {
           n.id !== a.id &&
           n.stage !== 'juvenile' &&
           n.sex === a.sex &&
-          a.pos.distanceTo(n.pos) < 17
+          dist3(a.pos, n.pos) < 16
       );
       if (rivalTiger) {
         this.enterDefend(a, rivalTiger, 'Прогоняет чужака со своей территории');
@@ -637,7 +688,6 @@ export class Simulation {
       }
     }
 
-    // Keep ongoing critical actions until finished or timed out
     if (
       (a.state === 'drinking' && a.thirst < 92) ||
       (a.state === 'feeding' && a.hunger < 92 && this.getCarcass(a.targetCarcassId)) ||
@@ -648,10 +698,9 @@ export class Simulation {
       return;
     }
 
-    // 3. Juvenile follows mother or herd adult
     if (a.stage === 'juvenile') {
       const guardian = this.findGuardian(a, neighbors);
-      if (guardian && a.pos.distanceTo(guardian.pos) > 5.5) {
+      if (guardian && dist3(a.pos, guardian.pos) > 5.5) {
         a.state = 'following';
         a.targetAnimalId = guardian.id;
         a.statusText = 'Держится рядом со взрослыми';
@@ -660,7 +709,6 @@ export class Simulation {
       }
     }
 
-    // 4. Urgent Thirst
     if (a.thirst < 50 && a.species !== 'hippo') {
       const waterPt = this.findNearestWaterTarget(a);
       if (waterPt) {
@@ -672,15 +720,13 @@ export class Simulation {
       }
     } else if (a.species === 'hippo' && a.thirst < 60) {
       a.thirst = Math.min(100, a.thirst + 10);
-      const riverPt = this.findNearestRiverPool(a.pos);
       a.state = 'cooling';
-      a.targetPos = riverPt;
+      a.targetPos = this.findNearestRiverPool(a.pos);
       a.statusText = 'Возвращается в речную лагуну';
       a.stateTimer = 14;
       return;
     }
 
-    // 5. Hippo strict circadian rhythm: River by day, Grazing meadows by night!
     if (a.species === 'hippo') {
       const isNightTime = this.timeState.hour >= 18 || this.timeState.hour < 6;
       const depthHere = getWaterDepth(a.pos.x, a.pos.z, this.season.wetness);
@@ -693,32 +739,28 @@ export class Simulation {
         }
         return;
       } else if (a.hunger < 88) {
-        const grazePt = this.findBankGrazingSpot(a.pos);
         a.state = 'grazing';
-        a.targetPos = grazePt;
+        a.targetPos = this.findBankGrazingSpot(a.pos);
         a.statusText = 'Выходит на ночной выпас';
         a.stateTimer = 11;
         return;
       }
     }
 
-    // 6. Predator hunting & scavenging
     if (cfg.diet === 'carnivore') {
       const carcass = this.findNearestCarcass(a.pos, 42);
       if (carcass && a.hunger < 84) {
         a.state = 'feeding';
         a.targetCarcassId = carcass.id;
-        a.targetPos = carcass.pos.clone();
+        a.targetPos = { ...carcass.pos };
         a.statusText = 'Питается добычей';
         a.stateTimer = 10;
         return;
       }
 
-      // Join ongoing hunt or start new hunt
       const isPrimeHuntHour =
         this.timeState.hour < 8.5 || this.timeState.hour > 16.8 || a.hunger < 42;
       if (a.stage !== 'juvenile' && a.hunger < (isPrimeHuntHour ? 72 : 52) && a.energy > 28) {
-        // Lions coordinate with pride mates
         if (a.species === 'lion') {
           const huntingMate = neighbors.find(
             (n) =>
@@ -741,7 +783,7 @@ export class Simulation {
 
         const prey = this.findBestPrey(a, neighbors);
         if (prey) {
-          const dist = a.pos.distanceTo(prey.pos);
+          const dist = dist3(a.pos, prey.pos);
           a.state = dist < 15 ? 'chasing' : 'stalking';
           a.targetAnimalId = prey.id;
           a.statusText = a.state === 'stalking' ? 'Крадётся к добыче' : 'Преследует добычу!';
@@ -751,7 +793,6 @@ export class Simulation {
       }
     }
 
-    // 7. Midday heat resting / cooling
     if (
       this.timeState.temperature > 0.68 &&
       a.hunger > 42 &&
@@ -770,30 +811,27 @@ export class Simulation {
       }
       a.state = 'resting';
       a.targetPos = this.findShadeSpot(a);
-      a.statusText = a.species === 'lion' ? 'Спит в тени на скалах' : 'Отдыхает в тени от зноя';
+      a.statusText = 'Идёт в тень отдохнуть';
       a.stateTimer = 10 + Math.random() * 6;
       return;
     }
 
-    // Low energy resting at any time
     if (a.energy < 25) {
       a.state = 'resting';
       a.targetPos = this.findShadeSpot(a);
-      a.statusText = 'Восстанавливает силы';
+      a.statusText = 'Идёт в тень отдохнуть';
       a.stateTimer = 9;
       return;
     }
 
-    // 8. Herbivore Hunger (Browsing tall trees vs Grazing grass)
     if (cfg.diet === 'browser' && a.hunger < 74) {
       const treeIdx = this.findNearestFoodTree(a.pos, a.species === 'giraffe');
       if (treeIdx !== null) {
         a.state = 'browsing';
         a.targetTreeIdx = treeIdx;
         const tree = this.trees[treeIdx];
-        a.targetPos = new THREE.Vector3(tree.x, tree.y, tree.z);
-        a.statusText =
-          a.species === 'giraffe' ? 'Объедает крону акации' : 'Срывает ветви хоботом';
+        a.targetPos = { x: tree.x, y: tree.y, z: tree.z };
+        a.statusText = 'Направляется к кронам деревьев';
         a.stateTimer = 9;
         return;
       }
@@ -802,12 +840,11 @@ export class Simulation {
     if ((cfg.diet === 'grazer' || cfg.diet === 'omnivore' || cfg.diet === 'browser') && a.hunger < 74) {
       a.state = 'grazing';
       a.targetPos = this.findGrazingSpot(a);
-      a.statusText = 'Щиплет траву на пастбище';
+      a.statusText = 'Идёт на пастбище';
       a.stateTimer = 9;
       return;
     }
 
-    // 9. Reproduction / Courting when healthy & below cap
     if (
       a.stage === 'adult' &&
       a.reproCooldown <= 0 &&
@@ -825,7 +862,7 @@ export class Simulation {
           n.hunger > 60 &&
           n.state !== 'fleeing' &&
           n.state !== 'chasing' &&
-          a.pos.distanceTo(n.pos) < 18
+          dist3(a.pos, n.pos) < 18
       );
       if (mate) {
         a.state = 'courting';
@@ -836,9 +873,11 @@ export class Simulation {
       }
     }
 
-    // 10. Occasional ford crossing / wandering in home biome
-    if (a.stateTimer <= 0 || a.targetPos === null || a.pos.distanceTo(a.targetPos) < 3) {
-      // Dry season ford migration chance for elephants, zebras, giraffes, tigers
+    if (
+      a.stateTimer <= 0 ||
+      a.targetPos === null ||
+      Math.hypot(a.pos.x - a.targetPos.x, a.pos.z - a.targetPos.z) < 3
+    ) {
       if (
         this.season.wetness < 0.48 &&
         (a.species === 'elephant' || a.species === 'zebra' || a.species === 'tiger') &&
@@ -847,7 +886,11 @@ export class Simulation {
         const ford = FORDS[Math.floor(Math.random() * FORDS.length)];
         const sideShift = a.pos.x < getRiverCenterX(ford.z) ? 20 : -20;
         a.state = 'crossing';
-        a.targetPos = new THREE.Vector3(getRiverCenterX(ford.z) + sideShift, 0, ford.z + (Math.random() - 0.5) * 6);
+        a.targetPos = {
+          x: getRiverCenterX(ford.z) + sideShift,
+          y: 0,
+          z: ford.z + (Math.random() - 0.5) * 6,
+        };
         a.statusText =
           a.species === 'tiger' ? 'Переплывает реку' : `Переходит ${ford.name.toLowerCase()}`;
         a.stateTimer = 16;
@@ -861,21 +904,20 @@ export class Simulation {
     }
   }
 
-  private decideVultureBehavior(a: Animal, neighbors: Animal[]): void {
-    // Keep ongoing drinking
-    if (a.state === 'drinking' && a.thirst < 94) {
+  private decideVultureBehavior(a: SimAnimal, neighbors: SimAnimal[]): void {
+    if ((a.state === 'drinking' && a.thirst < 94) || (a.state === 'perching' && a.stateTimer > 0)) {
       return;
     }
 
-    // Drink at shallow water edges when thirsty
+    // Drink ONLY from a dry bank shore spot!
     if (a.thirst < 42) {
-      const waterPt = this.findNearestWaterTarget(a);
-      if (waterPt) {
+      const shorePt = this.findDryShoreDrinkPoint(a);
+      if (shorePt) {
         a.state = 'seeking_water';
-        a.targetPos = waterPt;
+        a.targetPos = shorePt;
         a.targetCarcassId = null;
-        a.statusText = 'Летит к водопою';
-        a.stateTimer = 14;
+        a.statusText = 'Летит к береговому водопою';
+        a.stateTimer = 16;
         return;
       }
     }
@@ -883,107 +925,66 @@ export class Simulation {
     const carcass = this.findNearestCarcass(a.pos, 95);
     if (carcass) {
       const dangerousNear = neighbors.some(
-        (n) =>
-          (n.species === 'lion' || n.species === 'tiger') &&
-          n.pos.distanceTo(carcass.pos) < 11
+        (n) => (n.species === 'lion' || n.species === 'tiger') && dist3(n.pos, carcass.pos) < 12
       );
       if (!dangerousNear && a.hunger < 88) {
         a.state = 'scavenging';
         a.targetCarcassId = carcass.id;
-        a.targetPos = carcass.pos.clone();
+        a.targetPos = { ...carcass.pos };
         a.statusText = 'Кормится у добычи';
         a.stateTimer = 8;
         return;
       }
       a.state = 'soaring';
       a.targetCarcassId = carcass.id;
-      a.targetPos = carcass.pos.clone();
-      a.statusText = 'Кружит над добычей';
+      a.targetPos = { ...carcass.pos };
+      a.statusText = 'Высоко кружит над добычей';
       a.stateTimer = 8;
       return;
+    }
+
+    // Occasionally perch on top of a dry dead snag tree!
+    if (a.energy < 58 || (a.hunger > 75 && Math.random() < 0.14)) {
+      const snag = this.findNearestSnagTree(a.pos);
+      if (snag) {
+        a.state = 'perching';
+        a.targetCarcassId = null;
+        a.targetPos = { x: snag.x, y: snag.y + snag.canopyHeight, z: snag.z };
+        a.statusText = 'Направляется на ветвь сухого дерева';
+        a.stateTimer = 14 + Math.random() * 8;
+        return;
+      }
     }
 
     a.state = 'soaring';
     a.targetCarcassId = null;
     if (!a.targetPos || a.stateTimer <= 0) {
-      a.targetPos = new THREE.Vector3(
-        (Math.random() - 0.5) * 120,
-        0,
-        (Math.random() - 0.5) * 120
-      );
-      a.stateTimer = 12;
+      a.targetPos = {
+        x: (Math.random() - 0.5) * 110,
+        y: 0,
+        z: (Math.random() - 0.5) * 110,
+      };
+      a.stateTimer = 14;
     }
-    a.statusText = 'Парит над долиной';
+    a.statusText = 'Парит высоко над долиной';
   }
 
   private executeState(
-    a: Animal,
+    a: SimAnimal,
     simDt: number,
-    neighbors: Animal[],
+    neighbors: SimAnimal[],
     counts: Record<SpeciesId, number>
   ): void {
     const cfg = SPECIES_CONFIGS[a.species];
 
     if (a.species === 'vulture') {
-      if (a.state === 'seeking_water' && a.targetPos) {
-        const distXZ = Math.hypot(a.pos.x - a.targetPos.x, a.pos.z - a.targetPos.z);
-        const groundY = getTerrainHeight(a.pos.x, a.pos.z);
-        if (distXZ > 2.2) {
-          this.steerTowards(a, a.targetPos, cfg.runSpeed * 0.9, simDt, false);
-          a.pos.y = THREE.MathUtils.lerp(a.pos.y, groundY + 2.2, Math.min(1, simDt * 2.5));
-        } else {
-          a.speed = 0;
-          a.pos.y = Math.max(groundY, getWaterLevel(this.season.wetness) + 0.05);
-          a.state = 'drinking';
-          a.statusText = 'Пьёт воду у берега';
-          a.stateTimer = 5;
-        }
-      } else if (a.state === 'drinking') {
-        a.speed = 0;
-        a.thirst = Math.min(100, a.thirst + simDt * 22);
-        if (a.thirst >= 95) {
-          a.state = 'soaring';
-          a.statusText = 'Парит над долиной';
-        }
-      } else if (a.state === 'scavenging' && a.targetPos) {
-        const distXZ = Math.hypot(a.pos.x - a.targetPos.x, a.pos.z - a.targetPos.z);
-        const groundY = getTerrainHeight(a.pos.x, a.pos.z);
-        if (distXZ > 2.2) {
-          this.steerTowards(a, a.targetPos, cfg.runSpeed * 0.9, simDt, false);
-          a.pos.y = THREE.MathUtils.lerp(a.pos.y, groundY + 1.5, Math.min(1, simDt * 2));
-        } else {
-          a.speed = 0;
-          a.pos.y = groundY;
-          const carcass = this.getCarcass(a.targetCarcassId);
-          if (carcass && carcass.meatRemaining > 0) {
-            const bite = Math.min(carcass.meatRemaining, simDt * 2.2);
-            carcass.meatRemaining -= bite;
-            a.hunger = Math.min(100, a.hunger + bite * 6);
-            a.thirst = Math.min(100, a.thirst + bite * 3.5);
-          } else {
-            a.state = 'soaring';
-          }
-        }
-      } else {
-        // Smooth circular soaring in sky
-        a.soarAngle += simDt * 0.42;
-        const center = a.targetPos ?? new THREE.Vector3(0, 0, 0);
-        const orbitR = a.targetCarcassId ? 11 : 28;
-        const tx = center.x + Math.cos(a.soarAngle) * orbitR;
-        const tz = center.z + Math.sin(a.soarAngle) * orbitR;
-        const targetPt = new THREE.Vector3(tx, 0, tz);
-        this.steerTowards(a, targetPt, cfg.runSpeed, simDt, false);
-        const targetAlt = getTerrainHeight(a.pos.x, a.pos.z) + (a.targetCarcassId ? 13 : a.soarHeight);
-        a.pos.y = THREE.MathUtils.lerp(a.pos.y, targetAlt, Math.min(1, simDt * 1.8));
-      }
-      a.rig.root.position.copy(a.pos);
-      a.rig.root.rotation.y = a.yaw;
+      this.executeVulture(a, simDt, cfg.runSpeed);
       return;
     }
 
     switch (a.state) {
       case 'resting': {
-        if (a.targetPos && a.pos.distanceTo(a.targetPos) > 2.2) {
+        if (a.targetPos && Math.hypot(a.pos.x - a.targetPos.x, a.pos.z - a.targetPos.z) > 2.4) {
           this.steerTowards(a, a.targetPos, cfg.walkSpeed * 0.8, simDt, true);
           a.statusText = 'Идёт в тень отдохнуть';
         } else {
@@ -997,16 +998,10 @@ export class Simulation {
         if (!a.targetPos) break;
         const depth = getWaterDepth(a.pos.x, a.pos.z, this.season.wetness);
         const dist = Math.hypot(a.pos.x - a.targetPos.x, a.pos.z - a.targetPos.z);
-        if (depth > 0.04 && depth < 0.48) {
+        if ((depth > 0.04 && depth < 0.48) || dist < 1.8) {
           a.state = 'drinking';
           a.statusText = 'Пьёт воду';
           a.stateTimer = 6;
-          a.speed = 0;
-        } else if (dist < 1.8) {
-          // Step slightly closer toward water center if dry shore
-          a.state = 'drinking';
-          a.statusText = 'Пьёт воду';
-          a.stateTimer = 5.5;
           a.speed = 0;
         } else {
           this.steerTowards(a, a.targetPos, cfg.walkSpeed * 1.05, simDt, true);
@@ -1035,9 +1030,6 @@ export class Simulation {
           a.speed = 0;
           a.thirst = Math.min(100, a.thirst + simDt * 7);
           a.energy = Math.min(100, a.energy + simDt * 2.5);
-          if (Math.random() < simDt * 0.45) {
-            this.atmosphere.spawnSplash(a.pos.x, getWaterLevel(this.season.wetness), a.pos.z, 2);
-          }
         }
         break;
       }
@@ -1045,9 +1037,13 @@ export class Simulation {
       case 'browsing': {
         if (!a.targetPos) break;
         const dist = Math.hypot(a.pos.x - a.targetPos.x, a.pos.z - a.targetPos.z);
-        if (dist > 3.2) {
+        const treeRadius =
+          a.targetTreeIdx !== null && this.trees[a.targetTreeIdx]
+            ? this.trees[a.targetTreeIdx].trunkRadius + cfg.adultRadius + 1.8
+            : 3.4;
+        if (dist > treeRadius) {
           this.steerTowards(a, a.targetPos, cfg.walkSpeed, simDt, true);
-          a.statusText = 'Направляется к акациям';
+          a.statusText = 'Направляется к кронам деревьев';
         } else {
           a.speed = 0;
           a.statusText =
@@ -1082,7 +1078,7 @@ export class Simulation {
           a.state = 'wandering';
           break;
         }
-        const dist = a.pos.distanceTo(guardian.pos);
+        const dist = dist3(a.pos, guardian.pos);
         if (dist > 4.2) {
           const spd = dist > 10 ? cfg.runSpeed * 0.8 : cfg.walkSpeed * 1.15;
           this.steerTowards(a, guardian.pos, spd, simDt, true);
@@ -1098,7 +1094,7 @@ export class Simulation {
           a.state = 'wandering';
           break;
         }
-        const dist = a.pos.distanceTo(prey.pos);
+        const dist = dist3(a.pos, prey.pos);
         if (dist < 14.5) {
           a.state = 'chasing';
           a.statusText = 'Стремительный бросок!';
@@ -1117,22 +1113,18 @@ export class Simulation {
           a.statusText = 'Отказывается от погони';
           break;
         }
-        const dist = a.pos.distanceTo(prey.pos);
+        const dist = dist3(a.pos, prey.pos);
         if (dist > 46) {
           a.state = 'wandering';
           a.targetAnimalId = null;
           break;
         }
         this.steerTowards(a, prey.pos, cfg.runSpeed, simDt, cfg.avoidsDeepWater);
-        if (Math.random() < simDt * 4) {
-          this.atmosphere.spawnDust(a.pos.x, a.pos.y, a.pos.z, 1);
-        }
 
         const reach = cfg.adultRadius + SPECIES_CONFIGS[prey.species].adultRadius + 0.85;
         if (dist <= reach && a.attackCooldown <= 0) {
           a.attackCooldown = 1.2;
-          const damage = a.species === 'tiger' ? 56 : 48;
-          prey.health -= damage;
+          prey.health -= a.species === 'tiger' ? 56 : 48;
           prey.threatAnimalId = a.id;
           prey.state = 'fleeing';
           if (prey.health <= 0) {
@@ -1163,32 +1155,34 @@ export class Simulation {
 
       case 'fleeing': {
         const threat = this.getAnimalById(a.threatAnimalId);
-        let awayDir: THREE.Vector3;
+        let ax = Math.sin(a.yaw);
+        let az = Math.cos(a.yaw);
         if (threat) {
-          awayDir = a.pos.clone().sub(threat.pos).setY(0).normalize();
-        } else {
-          awayDir = new THREE.Vector3(Math.sin(a.yaw), 0, Math.cos(a.yaw));
+          const dx = a.pos.x - threat.pos.x;
+          const dz = a.pos.z - threat.pos.z;
+          const len = Math.hypot(dx, dz) || 1;
+          ax = dx / len;
+          az = dz / len;
         }
-        const escapePt = a.pos.clone().addScaledVector(awayDir, 20);
-        this.steerTowards(a, escapePt, cfg.runSpeed, simDt, cfg.avoidsDeepWater);
-        if (Math.random() < simDt * 5) {
-          this.atmosphere.spawnDust(a.pos.x, a.pos.y, a.pos.z, 1);
-        }
+        this.steerTowards(
+          a,
+          { x: a.pos.x + ax * 20, y: a.pos.y, z: a.pos.z + az * 20 },
+          cfg.runSpeed,
+          simDt,
+          cfg.avoidsDeepWater
+        );
         break;
       }
 
       case 'defending': {
         const threat = this.getAnimalById(a.threatAnimalId);
-        if (!threat || a.pos.distanceTo(threat.pos) > 16 || a.stateTimer <= 0) {
+        if (!threat || dist3(a.pos, threat.pos) > 16 || a.stateTimer <= 0) {
           a.state = 'wandering';
           a.threatAnimalId = null;
           break;
         }
-        const dist = a.pos.distanceTo(threat.pos);
+        const dist = dist3(a.pos, threat.pos);
         this.steerTowards(a, threat.pos, cfg.runSpeed * 0.92, simDt, false);
-        if (Math.random() < simDt * 4) {
-          this.atmosphere.spawnDust(a.pos.x, a.pos.y, a.pos.z, 1);
-        }
         const reach = cfg.adultRadius + SPECIES_CONFIGS[threat.species].adultRadius + 1.1;
         if (dist <= reach && a.attackCooldown <= 0) {
           a.attackCooldown = 2.4;
@@ -1198,11 +1192,10 @@ export class Simulation {
           threat.threatAnimalId = a.id;
           threat.stateTimer = 6.5;
           threat.targetAnimalId = null;
-          // Defender backs off after repelling the intruder
           a.state = 'wandering';
           a.threatAnimalId = null;
           if (threat.health <= 0) {
-            this.killAnimal(threat, `в схватке (${SPECIES_CONFIGS[a.species].nameRu})`);
+            this.killAnimal(threat);
           }
         }
         break;
@@ -1214,7 +1207,7 @@ export class Simulation {
           a.state = 'wandering';
           break;
         }
-        const dist = a.pos.distanceTo(mate.pos);
+        const dist = dist3(a.pos, mate.pos);
         if (dist > 2.4) {
           this.steerTowards(a, mate.pos, cfg.walkSpeed * 0.9, simDt, true);
         } else {
@@ -1252,10 +1245,13 @@ export class Simulation {
       default: {
         if (a.targetPos) {
           const dist = Math.hypot(a.pos.x - a.targetPos.x, a.pos.z - a.targetPos.z);
-          if (dist > 2.2) {
-            // Herd cohesion gentle pull
+          if (dist > 2.4) {
             const herdPull = this.computeHerdSeparationAndCohesion(a, neighbors);
-            const target = a.targetPos.clone().addScaledVector(herdPull, 4);
+            const target = {
+              x: a.targetPos.x + herdPull.x * 4,
+              y: a.targetPos.y,
+              z: a.targetPos.z + herdPull.z * 4,
+            };
             this.steerTowards(
               a,
               target,
@@ -1272,14 +1268,115 @@ export class Simulation {
         break;
       }
     }
+  }
 
-    a.rig.root.position.copy(a.pos);
-    a.rig.root.rotation.y = a.yaw;
+  private executeVulture(a: SimAnimal, simDt: number, flySpeed: number): void {
+    const waterY = getWaterLevel(this.season.wetness);
+    const groundY = getTerrainHeight(a.pos.x, a.pos.z);
+    const floorY = Math.max(groundY, waterY);
+
+    if (a.state === 'seeking_water' && a.targetPos) {
+      const distXZ = Math.hypot(a.pos.x - a.targetPos.x, a.pos.z - a.targetPos.z);
+      const targetGround = getTerrainHeight(a.targetPos.x, a.targetPos.z);
+      if (distXZ > 1.8) {
+        this.flyTowards(a, a.targetPos, flySpeed * 0.9, simDt);
+        const glideAlt = Math.max(floorY + 2.5, targetGround + Math.min(18, distXZ * 0.45));
+        a.pos.y += (glideAlt - a.pos.y) * Math.min(1, simDt * 2.2);
+      } else {
+        a.speed = 0;
+        a.pos.y = Math.max(groundY, waterY + 0.08);
+        a.state = 'drinking';
+        a.statusText = 'Пьёт воду с берега';
+        a.stateTimer = 5;
+      }
+      return;
+    }
+
+    if (a.state === 'drinking') {
+      a.speed = 0;
+      a.pos.y = Math.max(groundY, waterY + 0.08);
+      a.thirst = Math.min(100, a.thirst + simDt * 22);
+      if (a.thirst >= 95) {
+        a.state = 'soaring';
+        a.statusText = 'Парит высоко над долиной';
+      }
+      return;
+    }
+
+    if (a.state === 'perching' && a.targetPos) {
+      const distXZ = Math.hypot(a.pos.x - a.targetPos.x, a.pos.z - a.targetPos.z);
+      if (distXZ > 1.4) {
+        this.flyTowards(a, a.targetPos, flySpeed * 0.85, simDt);
+        const approachY = Math.max(floorY + 2, a.targetPos.y + Math.min(12, distXZ * 0.35));
+        a.pos.y += (approachY - a.pos.y) * Math.min(1, simDt * 2.5);
+      } else {
+        a.speed = 0;
+        a.pos.x = a.targetPos.x;
+        a.pos.z = a.targetPos.z;
+        a.pos.y = a.targetPos.y;
+        a.statusText = 'Высматривает долину с сухого дерева';
+      }
+      return;
+    }
+
+    if (a.state === 'scavenging' && a.targetPos) {
+      const distXZ = Math.hypot(a.pos.x - a.targetPos.x, a.pos.z - a.targetPos.z);
+      if (distXZ > 2.2) {
+        this.flyTowards(a, a.targetPos, flySpeed * 0.9, simDt);
+        const landY = Math.max(floorY + 1.5, getTerrainHeight(a.targetPos.x, a.targetPos.z) + distXZ * 0.35);
+        a.pos.y += (landY - a.pos.y) * Math.min(1, simDt * 2.2);
+      } else {
+        a.speed = 0;
+        a.pos.y = Math.max(groundY, waterY + 0.15);
+        const carcass = this.getCarcass(a.targetCarcassId);
+        if (carcass && carcass.meatRemaining > 0) {
+          const bite = Math.min(carcass.meatRemaining, simDt * 2.2);
+          carcass.meatRemaining -= bite;
+          a.hunger = Math.min(100, a.hunger + bite * 6);
+          a.thirst = Math.min(100, a.thirst + bite * 3.5);
+        } else {
+          a.state = 'soaring';
+        }
+      }
+      return;
+    }
+
+    // Smooth majestic thermal soaring: tangential speed strictly <= 75% of flySpeed!
+    const center = a.targetPos ?? { x: 0, y: 0, z: 0 };
+    const orbitR = a.targetCarcassId ? 15 : 32;
+    const angularSpeed = (flySpeed * 0.72) / orbitR;
+    a.soarAngle += simDt * angularSpeed;
+
+    const tx = center.x + Math.cos(a.soarAngle) * orbitR;
+    const tz = center.z + Math.sin(a.soarAngle) * orbitR;
+    this.flyTowards(a, { x: tx, y: 0, z: tz }, flySpeed * 0.88, simDt);
+
+    const desiredAlt = floorY + (a.targetCarcassId ? 18 : a.soarHeight);
+    a.pos.y += (desiredAlt - a.pos.y) * Math.min(1, simDt * 2.4);
+    a.pos.y = Math.max(floorY + 14, a.pos.y); // Never dip near ground or water while soaring!
+  }
+
+  private flyTowards(a: SimAnimal, target: Vec3, speed: number, simDt: number): void {
+    const dx = target.x - a.pos.x;
+    const dz = target.z - a.pos.z;
+    const len = Math.hypot(dx, dz);
+    if (len < 0.05) {
+      a.speed = 0;
+      return;
+    }
+    const targetYaw = Math.atan2(dx / len, dz / len);
+    let diff = targetYaw - a.yaw;
+    while (diff > Math.PI) diff -= Math.PI * 2;
+    while (diff < -Math.PI) diff += Math.PI * 2;
+    a.yaw += diff * Math.min(1, simDt * 3.2);
+    a.speed = speed;
+    a.pos.x = Math.max(-WORLD_HALF + 4, Math.min(WORLD_HALF - 4, a.pos.x + Math.sin(a.yaw) * speed * simDt));
+    a.pos.z = Math.max(-WORLD_HALF + 4, Math.min(WORLD_HALF - 4, a.pos.z + Math.cos(a.yaw) * speed * simDt));
   }
 
   private steerTowards(
-    a: Animal,
-    target: THREE.Vector3,
+    a: SimAnimal,
+    target: Vec3,
     desiredSpeed: number,
     simDt: number,
     avoidDeepWater: boolean
@@ -1295,14 +1392,12 @@ export class Simulation {
     dx /= len;
     dz /= len;
 
-    // Look ahead for deep water avoidance (lions & savanna herbivores stay out of deep water unless at a ford!)
+    // 1. Deep water avoidance
     if (avoidDeepWater) {
       const lookDist = 3.5 + cfg.adultRadius;
       const probeX = a.pos.x + dx * lookDist;
       const probeZ = a.pos.z + dz * lookDist;
-      const probeDepth = getWaterDepth(probeX, probeZ, this.season.wetness);
-      if (probeDepth > cfg.maxWaterDepth) {
-        // Redirect toward nearest shallow ford if trying to cross, else steer parallel along bank
+      if (getWaterDepth(probeX, probeZ, this.season.wetness) > cfg.maxWaterDepth) {
         const targetSide = target.x > getRiverCenterX(target.z) ? 1 : -1;
         const mySide = a.pos.x > getRiverCenterX(a.pos.z) ? 1 : -1;
         if (targetSide !== mySide && a.state !== 'fleeing') {
@@ -1313,7 +1408,6 @@ export class Simulation {
           dx /= fl;
           dz /= fl;
         } else {
-          // Turn tangent around water obstacle toward goal direction
           const t1x = -dz;
           const t1z = dx;
           const dot1 = t1x * (target.x - a.pos.x) + t1z * (target.z - a.pos.z);
@@ -1324,7 +1418,34 @@ export class Simulation {
       }
     }
 
-    // Smooth yaw rotation
+    // 2. Smooth obstacle avoidance around tree trunks, bushes & boulders
+    const myR = cfg.adultRadius * (a.stage === 'juvenile' ? 0.55 : 0.92);
+    const nearbyColliders = this.colliderGrid.query(a.pos.x, a.pos.z, myR + 5.5);
+    let avoidX = 0;
+    let avoidZ = 0;
+    for (let i = 0; i < nearbyColliders.length; i++) {
+      const c = nearbyColliders[i];
+      const ox = c.x - a.pos.x;
+      const oz = c.z - a.pos.z;
+      const d = Math.hypot(ox, oz);
+      const minClear = myR + c.radius + 1.4;
+      if (d > 0.01 && d < minClear + 2.8) {
+        const forwardDot = (ox * dx + oz * dz) / d;
+        if (forwardDot > 0.1 || d < minClear) {
+          const strength = (minClear + 2.8 - d) / (minClear + 2.8);
+          avoidX -= (ox / d) * strength * 2.2;
+          avoidZ -= (oz / d) * strength * 2.2;
+        }
+      }
+    }
+    if (avoidX !== 0 || avoidZ !== 0) {
+      dx += avoidX;
+      dz += avoidZ;
+      const nl = Math.hypot(dx, dz) || 1;
+      dx /= nl;
+      dz /= nl;
+    }
+
     const targetYaw = Math.atan2(dx, dz);
     let diff = targetYaw - a.yaw;
     while (diff > Math.PI) diff -= Math.PI * 2;
@@ -1332,13 +1453,8 @@ export class Simulation {
     a.yaw += diff * Math.min(1, simDt * 5.2);
 
     const depthHere = getWaterDepth(a.pos.x, a.pos.z, this.season.wetness);
-    const wasSwimming = a.isSwimming;
-    a.isSwimming = depthHere > cfg.maxWaterDepth * 0.68 || (a.species === 'hippo' && depthHere > 0.35);
-
-    if (a.isSwimming && !wasSwimming) {
-      this.atmosphere.spawnSplash(a.pos.x, getWaterLevel(this.season.wetness), a.pos.z, 5);
-      this.soundscape.playSplash(a.pos, this.cameraTargetRef);
-    }
+    a.isSwimming =
+      depthHere > cfg.maxWaterDepth * 0.68 || (a.species === 'hippo' && depthHere > 0.35);
 
     const actualSpeed = a.isSwimming
       ? Math.min(desiredSpeed, cfg.swimSpeed)
@@ -1347,24 +1463,46 @@ export class Simulation {
         : desiredSpeed;
 
     a.speed = actualSpeed;
-    const nx = a.pos.x + Math.sin(a.yaw) * actualSpeed * simDt;
-    const nz = a.pos.z + Math.cos(a.yaw) * actualSpeed * simDt;
+    a.pos.x = Math.max(
+      -WORLD_HALF + 2,
+      Math.min(WORLD_HALF - 2, a.pos.x + Math.sin(a.yaw) * actualSpeed * simDt)
+    );
+    a.pos.z = Math.max(
+      -WORLD_HALF + 2,
+      Math.min(WORLD_HALF - 2, a.pos.z + Math.cos(a.yaw) * actualSpeed * simDt)
+    );
 
-    // Valley bounds clamp
-    a.pos.x = Math.max(-WORLD_HALF + 2, Math.min(WORLD_HALF - 2, nx));
-    a.pos.z = Math.max(-WORLD_HALF + 2, Math.min(WORLD_HALF - 2, nz));
+    // 3. Hard circle-circle collision resolution (never clip into trees or boulders!)
+    this.resolveStaticCollisions(a);
 
     const groundY = getTerrainHeight(a.pos.x, a.pos.z);
     const waterY = getWaterLevel(this.season.wetness);
-    if (a.isSwimming) {
-      a.pos.y = Math.max(groundY, waterY - 0.35);
-    } else {
-      a.pos.y = groundY;
+    a.pos.y = a.isSwimming ? Math.max(groundY, waterY - 0.35) : groundY;
+  }
+
+  private resolveStaticCollisions(a: SimAnimal): void {
+    const cfg = SPECIES_CONFIGS[a.species];
+    const myR = cfg.adultRadius * (a.stage === 'juvenile' ? 0.55 : 0.88);
+    const nearby = this.colliderGrid.query(a.pos.x, a.pos.z, myR + 4.5);
+
+    for (let i = 0; i < nearby.length; i++) {
+      const c = nearby[i];
+      const dx = a.pos.x - c.x;
+      const dz = a.pos.z - c.z;
+      const dist = Math.hypot(dx, dz);
+      const minD = myR + c.radius;
+      if (dist < minD) {
+        const push = minD - dist;
+        const nx = dist > 0.001 ? dx / dist : 1;
+        const nz = dist > 0.001 ? dz / dist : 0;
+        a.pos.x += nx * push;
+        a.pos.z += nz * push;
+      }
     }
   }
 
-  private computeHerdSeparationAndCohesion(a: Animal, neighbors: Animal[]): THREE.Vector3 {
-    const steer = new THREE.Vector3();
+  private computeHerdSeparationAndCohesion(a: SimAnimal, neighbors: SimAnimal[]): Vec3 {
+    const steer = { x: 0, y: 0, z: 0 };
     const myR = SPECIES_CONFIGS[a.species].adultRadius;
     for (let i = 0; i < neighbors.length; i++) {
       const o = neighbors[i];
@@ -1382,27 +1520,24 @@ export class Simulation {
     return steer;
   }
 
-  private findNearestThreat(a: Animal, neighbors: Animal[]): Animal | null {
+  private findNearestThreat(a: SimAnimal, neighbors: SimAnimal[]): SimAnimal | null {
     const isJuvPredator =
       (a.species === 'lion' || a.species === 'tiger') && a.stage === 'juvenile';
-    let best: Animal | null = null;
+    let best: SimAnimal | null = null;
     let bestDist = Infinity;
 
     for (let i = 0; i < neighbors.length; i++) {
       const n = neighbors[i];
       if (!n.alive || n.species === a.species) continue;
-
       const isPredator = n.species === 'lion' || n.species === 'tiger';
       const isChargingGiant =
         (n.species === 'elephant' || n.species === 'hippo') && n.state === 'defending';
 
-      if (isJuvPredator && !isChargingGiant && n.species !== 'lion' && n.species !== 'tiger') {
-        continue;
-      }
+      if (isJuvPredator && !isChargingGiant && !isPredator) continue;
       if (!isPredator && !isChargingGiant) continue;
       if (isPredator && n.stage === 'juvenile') continue;
 
-      const dist = a.pos.distanceTo(n.pos);
+      const dist = dist3(a.pos, n.pos);
       const alertRange =
         n.state === 'chasing' || n.state === 'defending'
           ? 24
@@ -1420,8 +1555,8 @@ export class Simulation {
     return best;
   }
 
-  private findBestPrey(predator: Animal, neighbors: Animal[]): Animal | null {
-    let best: Animal | null = null;
+  private findBestPrey(predator: SimAnimal, neighbors: SimAnimal[]): SimAnimal | null {
+    let best: SimAnimal | null = null;
     let bestScore = -Infinity;
 
     for (let i = 0; i < neighbors.length; i++) {
@@ -1429,7 +1564,7 @@ export class Simulation {
       if (!n.alive || n.species === predator.species) continue;
       if (n.species === 'vulture' || n.species === 'lion' || n.species === 'tiger') continue;
 
-      const dist = predator.pos.distanceTo(n.pos);
+      const dist = dist3(predator.pos, n.pos);
       let score = 40 - dist;
 
       if (n.species === 'zebra' || n.species === 'antelope' || n.species === 'deer' || n.species === 'boar') {
@@ -1438,11 +1573,9 @@ export class Simulation {
         if (predator.hunger > 38 && n.stage !== 'juvenile') continue;
         score += n.stage === 'juvenile' ? 14 : -8;
       } else if (n.species === 'elephant' || n.species === 'hippo') {
-        // Never attack healthy adult elephants/hippos unless starving
         if (n.stage !== 'juvenile' && predator.hunger > 15) continue;
-        // Check if adult elephant/hippo protector is right next to calf
         const guarded = neighbors.some(
-          (g) => g.species === n.species && g.stage !== 'juvenile' && g.pos.distanceTo(n.pos) < 12
+          (g) => g.species === n.species && g.stage !== 'juvenile' && dist3(g.pos, n.pos) < 12
         );
         if (guarded && predator.hunger > 22) continue;
         score += 5;
@@ -1450,10 +1583,8 @@ export class Simulation {
 
       if (n.stage === 'juvenile') score += 10;
       if (n.health < 65) score += 14;
-
-      if (predator.species === 'lion') {
-        const depth = getWaterDepth(n.pos.x, n.pos.z, this.season.wetness);
-        if (depth > 0.48) score -= 50;
+      if (predator.species === 'lion' && getWaterDepth(n.pos.x, n.pos.z, this.season.wetness) > 0.48) {
+        score -= 50;
       }
 
       if (score > bestScore) {
@@ -1464,17 +1595,17 @@ export class Simulation {
     return bestScore > 10 ? best : null;
   }
 
-  private findGuardian(juv: Animal, neighbors: Animal[]): Animal | null {
+  private findGuardian(juv: SimAnimal, neighbors: SimAnimal[]): SimAnimal | null {
     if (juv.motherId !== null) {
       const mom = this.getAnimalById(juv.motherId);
       if (mom) return mom;
     }
-    let best: Animal | null = null;
+    let best: SimAnimal | null = null;
     let bestDist = Infinity;
     for (let i = 0; i < neighbors.length; i++) {
       const n = neighbors[i];
       if (n.species === juv.species && n.stage !== 'juvenile' && n.groupId === juv.groupId) {
-        const d = juv.pos.distanceTo(n.pos);
+        const d = dist3(juv.pos, n.pos);
         if (d < bestDist) {
           bestDist = d;
           best = n;
@@ -1484,30 +1615,27 @@ export class Simulation {
     return best;
   }
 
-  private enterDefend(a: Animal, threat: Animal, text: string): void {
+  private enterDefend(a: SimAnimal, threat: SimAnimal, text: string): void {
     const wasDefending = a.state === 'defending';
     a.state = 'defending';
     a.threatAnimalId = threat.id;
     a.statusText = text;
     a.stateTimer = 5.5;
-    if (!wasDefending) {
-      this.soundscape.playAnimalCall(a.species, a.pos, this.cameraTargetRef);
-      if (SPECIES_CONFIGS[a.species].isMainFive && Math.random() < 0.55) {
-        this.pushEvent(
-          SPECIES_CONFIGS[a.species].emoji,
-          `${getSpeciesTitleRu(a.species, a.sex)} ${a.name}: ${text.toLowerCase()}`,
-          a.pos,
-          2
-        );
-      }
+    if (!wasDefending && SPECIES_CONFIGS[a.species].isMainFive && Math.random() < 0.55) {
+      this.pushEvent(
+        SPECIES_CONFIGS[a.species].emoji,
+        `${getSpeciesTitleRu(a.species, a.sex)} ${a.name}: ${text.toLowerCase()}`,
+        a.pos,
+        2
+      );
     }
   }
 
-  private handlePredatorKill(predator: Animal, prey: Animal): void {
+  private handlePredatorKill(predator: SimAnimal, prey: SimAnimal): void {
     const pCfg = SPECIES_CONFIGS[predator.species];
     const vCfg = SPECIES_CONFIGS[prey.species];
 
-    this.killAnimal(prey, `добыча (${pCfg.nameRu})`);
+    this.killAnimal(prey);
     predator.state = 'feeding';
     predator.targetAnimalId = null;
     predator.statusText = 'Питается добычей';
@@ -1516,68 +1644,46 @@ export class Simulation {
     const latestCarcass = this.carcasses[this.carcasses.length - 1];
     if (latestCarcass) {
       predator.targetCarcassId = latestCarcass.id;
-      predator.targetPos = latestCarcass.pos.clone();
+      predator.targetPos = { ...latestCarcass.pos };
     }
 
-    this.soundscape.playAnimalCall(predator.species, predator.pos, this.cameraTargetRef);
-    const importance = vCfg.isMainFive ? 3 : 2;
     this.pushEvent(
       pCfg.emoji,
       `${getSpeciesTitleRu(predator.species, predator.sex)} ${predator.name} поймал добычу (${vCfg.nameRu.toLowerCase()})`,
       prey.pos,
-      importance
+      vCfg.isMainFive ? 3 : 2
     );
   }
 
-  private killAnimal(a: Animal, _reason: string): void {
+  private killAnimal(a: SimAnimal): void {
     if (!a.alive) return;
     a.alive = false;
-    this.animalRootGroup.remove(a.rig.root);
+    this.pendingRemoved.push(a.id);
+    this.lastBroadcastStatuses.delete(a.id);
 
     if (a.species !== 'vulture') {
-      this.spawnCarcass(a);
+      const meat =
+        a.species === 'elephant'
+          ? 95
+          : a.species === 'hippo'
+            ? 80
+            : a.species === 'giraffe'
+              ? 70
+              : a.species === 'zebra'
+                ? 42
+                : 30;
+      const y = getTerrainHeight(a.pos.x, a.pos.z);
+      this.carcasses.push({
+        id: this.nextCarcassId++,
+        species: a.species,
+        pos: { x: a.pos.x, y, z: a.pos.z },
+        yaw: a.yaw,
+        isJuvenile: a.stage === 'juvenile',
+        meatRemaining: meat,
+        maxMeat: meat,
+        ageSeconds: 0,
+      });
     }
-  }
-
-  private spawnCarcass(a: Animal): void {
-    const id = this.nextCarcassId++;
-    const meat =
-      a.species === 'elephant'
-        ? 95
-        : a.species === 'hippo'
-          ? 80
-          : a.species === 'giraffe'
-            ? 70
-            : a.species === 'zebra'
-              ? 42
-              : 30;
-
-    const group = new THREE.Group();
-    const scale = a.stage === 'juvenile' ? 0.55 : 0.95;
-    const body = new THREE.Mesh(
-      new THREE.BoxGeometry(0.8 * scale, 0.35 * scale, 1.3 * scale),
-      new THREE.MeshStandardMaterial({ color: 0x7d4c3b, roughness: 0.92, flatShading: true })
-    );
-    body.position.y = 0.16 * scale;
-    body.castShadow = true;
-    body.receiveShadow = true;
-    group.add(body);
-
-    const pos = a.pos.clone();
-    pos.y = getTerrainHeight(pos.x, pos.z);
-    group.position.copy(pos);
-    group.rotation.y = a.yaw;
-    this.carcassGroup.add(group);
-
-    this.carcasses.push({
-      id,
-      species: a.species,
-      pos,
-      meatRemaining: meat,
-      maxMeat: meat,
-      ageSeconds: 0,
-      mesh: group,
-    });
   }
 
   private updateCarcasses(simDt: number): void {
@@ -1585,18 +1691,13 @@ export class Simulation {
       const c = this.carcasses[i];
       c.ageSeconds += simDt;
       c.meatRemaining = Math.max(0, c.meatRemaining - simDt * 0.25);
-
-      const ratio = Math.max(0.25, c.meatRemaining / c.maxMeat);
-      c.mesh.scale.set(1, ratio, 1);
-
       if (c.meatRemaining <= 0.1 || c.ageSeconds > 160) {
-        this.carcassGroup.remove(c.mesh);
         this.carcasses.splice(i, 1);
       }
     }
   }
 
-  private getCarcass(id: number | null): Carcass | null {
+  private getCarcass(id: number | null): SimCarcass | null {
     if (id === null) return null;
     for (let i = 0; i < this.carcasses.length; i++) {
       if (this.carcasses[i].id === id) return this.carcasses[i];
@@ -1604,8 +1705,8 @@ export class Simulation {
     return null;
   }
 
-  private findNearestCarcass(pos: THREE.Vector3, maxDist: number): Carcass | null {
-    let best: Carcass | null = null;
+  private findNearestCarcass(pos: Vec3, maxDist: number): SimCarcass | null {
+    let best: SimCarcass | null = null;
     let bestD = maxDist;
     for (let i = 0; i < this.carcasses.length; i++) {
       const c = this.carcasses[i];
@@ -1619,27 +1720,24 @@ export class Simulation {
     return best;
   }
 
-  private findNearestWaterTarget(a: Animal): THREE.Vector3 | null {
+  private findNearestWaterTarget(a: SimAnimal): Vec3 | null {
     const cx = getRiverCenterX(a.pos.z);
     const hw = getRiverHalfWidth(a.pos.z);
     const side = a.pos.x < cx ? -1 : 1;
-    // Bank edge right in shallow water
-    let best = new THREE.Vector3(cx + side * (hw - 0.8), 0, a.pos.z + (Math.random() - 0.5) * 8);
-    let bestDist = a.pos.distanceTo(best);
+    let best: Vec3 = { x: cx + side * (hw - 0.8), y: 0, z: a.pos.z + (Math.random() - 0.5) * 8 };
+    let bestDist = dist3(a.pos, best);
 
-    // Check savanna watering holes if on savanna side and holding water
     if (a.pos.x < cx) {
       for (const hole of WATERING_HOLES) {
-        const holeCenterDepth = getWaterDepth(hole.x, hole.z, this.season.wetness);
-        if (holeCenterDepth < 0.16) continue;
+        if (getWaterDepth(hole.x, hole.z, this.season.wetness) < 0.16) continue;
         const ang = Math.atan2(a.pos.z - hole.z, a.pos.x - hole.x);
         const edgeDist = hole.radius * (0.45 + this.season.wetness * 0.42);
-        const pt = new THREE.Vector3(
-          hole.x + Math.cos(ang) * edgeDist,
-          0,
-          hole.z + Math.sin(ang) * edgeDist
-        );
-        const d = a.pos.distanceTo(pt);
+        const pt: Vec3 = {
+          x: hole.x + Math.cos(ang) * edgeDist,
+          y: 0,
+          z: hole.z + Math.sin(ang) * edgeDist,
+        };
+        const d = dist3(a.pos, pt);
         if (d < bestDist) {
           bestDist = d;
           best = pt;
@@ -1649,31 +1747,60 @@ export class Simulation {
     return best;
   }
 
-  private findNearestRiverPool(pos: THREE.Vector3): THREE.Vector3 {
-    const targetZ = Math.abs(pos.z + 24) < Math.abs(pos.z - 38) ? -24 : 38;
-    const z = THREE.MathUtils.lerp(pos.z, targetZ, 0.35) + (Math.random() - 0.5) * 10;
-    const cx = getRiverCenterX(z);
-    return new THREE.Vector3(cx + (Math.random() - 0.5) * 8, 0, z);
+  /** Dry bank shore spot strictly outside water for vultures! */
+  private findDryShoreDrinkPoint(a: SimAnimal): Vec3 | null {
+    const cx = getRiverCenterX(a.pos.z);
+    const hw = getRiverHalfWidth(a.pos.z);
+    const side = a.pos.x < cx ? -1 : 1;
+    const z = Math.max(-96, Math.min(96, a.pos.z));
+    // Step outward until depth === 0
+    for (let offset = hw - 2; offset <= hw + 10; offset += 0.8) {
+      const x = getRiverCenterX(z) + side * offset;
+      if (getWaterDepth(x, z, this.season.wetness) <= 0.01) {
+        return { x, y: getTerrainHeight(x, z), z };
+      }
+    }
+    return { x: cx + side * (hw + 4), y: getTerrainHeight(cx + side * (hw + 4), z), z };
   }
 
-  private findCoolingShoreSpot(a: Animal): THREE.Vector3 {
-    const z = THREE.MathUtils.clamp(a.pos.z + (Math.random() - 0.5) * 14, -95, 95);
+  private findNearestSnagTree(pos: Vec3): TreeNode | null {
+    let best: TreeNode | null = null;
+    let bestD = Infinity;
+    for (const t of this.trees) {
+      if (t.kind !== 'snag') continue;
+      const d = Math.hypot(pos.x - t.x, pos.z - t.z);
+      if (d < bestD) {
+        bestD = d;
+        best = t;
+      }
+    }
+    return best;
+  }
+
+  private findNearestRiverPool(pos: Vec3): Vec3 {
+    const targetZ = Math.abs(pos.z + 24) < Math.abs(pos.z - 38) ? -24 : 38;
+    const z = pos.z + (targetZ - pos.z) * 0.35 + (Math.random() - 0.5) * 10;
+    const cx = getRiverCenterX(z);
+    return { x: cx + (Math.random() - 0.5) * 8, y: 0, z };
+  }
+
+  private findCoolingShoreSpot(a: SimAnimal): Vec3 {
+    const z = Math.max(-95, Math.min(95, a.pos.z + (Math.random() - 0.5) * 14));
     const cx = getRiverCenterX(z);
     const hw = getRiverHalfWidth(z);
     const side = a.pos.x < cx ? -1 : 1;
-    return new THREE.Vector3(cx + side * (hw - 1.8), 0, z);
+    return { x: cx + side * (hw - 1.8), y: 0, z };
   }
 
-  private findBankGrazingSpot(pos: THREE.Vector3): THREE.Vector3 {
-    const z = THREE.MathUtils.clamp(pos.z + (Math.random() - 0.5) * 24, -98, 98);
+  private findBankGrazingSpot(pos: Vec3): Vec3 {
+    const z = Math.max(-98, Math.min(98, pos.z + (Math.random() - 0.5) * 24));
     const cx = getRiverCenterX(z);
     const hw = getRiverHalfWidth(z);
     const side = pos.x < cx ? -1 : 1;
-    return new THREE.Vector3(cx + side * (hw + 6 + Math.random() * 14), 0, z);
+    return { x: cx + side * (hw + 6 + Math.random() * 14), y: 0, z };
   }
 
-  private findShadeSpot(a: Animal): THREE.Vector3 {
-    // Lions love rocky kopjes or acacia shade
+  private findShadeSpot(a: SimAnimal): Vec3 {
     if (a.species === 'lion') {
       let bestK = this.kopjes[0];
       let bestD = Infinity;
@@ -1685,19 +1812,18 @@ export class Simulation {
         }
       }
       if (bestD < 48) {
-        return new THREE.Vector3(
-          bestK.x + (Math.random() - 0.5) * 8,
-          0,
-          bestK.z + (Math.random() - 0.5) * 8
-        );
+        return {
+          x: bestK.x + (Math.random() - 0.5) * 9,
+          y: 0,
+          z: bestK.z + (Math.random() - 0.5) * 9,
+        };
       }
     }
 
     let bestTree: TreeNode | null = null;
     let bestD = Infinity;
-    for (let i = 0; i < this.trees.length; i++) {
-      const t = this.trees[i];
-      if (t.kind === 'bush') continue;
+    for (const t of this.trees) {
+      if (t.kind === 'bush' || t.kind === 'snag') continue;
       const d = Math.hypot(a.pos.x - t.x, a.pos.z - t.z);
       if (d < bestD) {
         bestD = d;
@@ -1705,21 +1831,19 @@ export class Simulation {
       }
     }
     if (bestTree) {
-      return new THREE.Vector3(
-        bestTree.x + (Math.random() - 0.5) * 3.5,
-        0,
-        bestTree.z + (Math.random() - 0.5) * 3.5
-      );
+      const ang = Math.random() * Math.PI * 2;
+      const r = bestTree.trunkRadius + 2.2;
+      return { x: bestTree.x + Math.cos(ang) * r, y: 0, z: bestTree.z + Math.sin(ang) * r };
     }
-    return a.pos.clone();
+    return { ...a.pos };
   }
 
-  private findNearestFoodTree(pos: THREE.Vector3, preferAcacia: boolean): number | null {
+  private findNearestFoodTree(pos: Vec3, preferAcacia: boolean): number | null {
     let bestIdx: number | null = null;
     let bestScore = -Infinity;
     for (let i = 0; i < this.trees.length; i++) {
       const t = this.trees[i];
-      if (t.kind === 'bush' || t.foliage < 0.25) continue;
+      if (t.kind === 'bush' || t.kind === 'snag' || t.foliage < 0.25) continue;
       if (preferAcacia && t.kind === 'palm') continue;
       const d = Math.hypot(pos.x - t.x, pos.z - t.z);
       if (d > 62) continue;
@@ -1732,13 +1856,13 @@ export class Simulation {
     return bestIdx;
   }
 
-  private findGrazingSpot(a: Animal): THREE.Vector3 {
+  private findGrazingSpot(a: SimAnimal): Vec3 {
     const cfg = SPECIES_CONFIGS[a.species];
-    let best = a.pos.clone();
+    let best = { ...a.pos };
     let bestScore = -1;
     for (let i = 0; i < 6; i++) {
-      const rx = THREE.MathUtils.clamp(a.pos.x + (Math.random() - 0.5) * 32, -WORLD_HALF + 8, WORLD_HALF - 8);
-      const rz = THREE.MathUtils.clamp(a.pos.z + (Math.random() - 0.5) * 32, -WORLD_HALF + 8, WORLD_HALF - 8);
+      const rx = Math.max(-WORLD_HALF + 8, Math.min(WORLD_HALF - 8, a.pos.x + (Math.random() - 0.5) * 32));
+      const rz = Math.max(-WORLD_HALF + 8, Math.min(WORLD_HALF - 8, a.pos.z + (Math.random() - 0.5) * 32));
       const cx = getRiverCenterX(rz);
       if (cfg.homeBiome === 'savanna' && rx > cx - 6) continue;
       if (cfg.homeBiome === 'jungle' && rx < cx + 6) continue;
@@ -1746,33 +1870,35 @@ export class Simulation {
       const density = getGrassDensity(rx, rz, this.season.wetness);
       if (density > bestScore) {
         bestScore = density;
-        best = new THREE.Vector3(rx, 0, rz);
+        best = { x: rx, y: 0, z: rz };
       }
     }
     return best;
   }
 
-  private pickWanderPoint(a: Animal, neighbors: Animal[]): THREE.Vector3 {
+  private pickWanderPoint(a: SimAnimal, neighbors: SimAnimal[]): Vec3 {
     const cfg = SPECIES_CONFIGS[a.species];
-
-    // Herd/pride leaders stay roughly in home biome
     if (a.species !== 'elephant' && a.species !== 'tiger') {
       const peer = neighbors.find((n) => n.species === a.species && n.groupId === a.groupId && n.id !== a.id);
-      if (peer && a.pos.distanceTo(peer.pos) > 22) {
-        return peer.pos.clone().add(new THREE.Vector3((Math.random() - 0.5) * 6, 0, (Math.random() - 0.5) * 6));
+      if (peer && dist3(a.pos, peer.pos) > 22) {
+        return {
+          x: peer.pos.x + (Math.random() - 0.5) * 6,
+          y: 0,
+          z: peer.pos.z + (Math.random() - 0.5) * 6,
+        };
       }
     }
 
     for (let i = 0; i < 8; i++) {
-      const rx = THREE.MathUtils.clamp(a.pos.x + (Math.random() - 0.5) * 44, -WORLD_HALF + 10, WORLD_HALF - 10);
-      const rz = THREE.MathUtils.clamp(a.pos.z + (Math.random() - 0.5) * 44, -WORLD_HALF + 10, WORLD_HALF - 10);
+      const rx = Math.max(-WORLD_HALF + 10, Math.min(WORLD_HALF - 10, a.pos.x + (Math.random() - 0.5) * 44));
+      const rz = Math.max(-WORLD_HALF + 10, Math.min(WORLD_HALF - 10, a.pos.z + (Math.random() - 0.5) * 44));
       const cx = getRiverCenterX(rz);
       if (cfg.homeBiome === 'savanna' && rx > cx - 10) continue;
       if (cfg.homeBiome === 'jungle' && rx < cx + 10) continue;
       if (cfg.avoidsDeepWater && getWaterDepth(rx, rz, this.season.wetness) > cfg.maxWaterDepth) continue;
-      return new THREE.Vector3(rx, 0, rz);
+      return { x: rx, y: 0, z: rz };
     }
-    return a.homeCenter.clone();
+    return { ...a.homeCenter };
   }
 
   private checkNaturalMigration(counts: Record<SpeciesId, number>): void {
@@ -1823,35 +1949,27 @@ export class Simulation {
       case 'boar':
         return 'Бродит в тени подлеска';
       case 'vulture':
-        return 'Парит в восходящих потоках';
+        return 'Парит высоко над долиной';
     }
   }
 
-  public getCurrentBiomeRu(a: Animal): string {
-    const b = getBiome(a.pos.x, a.pos.z, this.season.wetness);
-    switch (b) {
-      case 'savanna':
-        return 'Саванна';
-      case 'jungle':
-        return 'Джунгли';
-      case 'river':
-        return 'Река';
-      case 'ford':
-        return 'Брод';
-      case 'waterhole':
-        return 'Водопой';
-    }
-  }
-
-  private pushEvent(icon: string, text: string, pos: THREE.Vector3, importance: number): void {
-    this.events.unshift({
+  private pushEvent(icon: string, text: string, pos: Vec3, importance: number): void {
+    const ev: WorldEvent = {
       id: this.nextEventId++,
       icon,
       text,
-      pos: pos.clone(),
+      x: Number(pos.x.toFixed(1)),
+      y: Number(pos.y.toFixed(1)),
+      z: Number(pos.z.toFixed(1)),
       importance,
-      createdAtReal: performance.now(),
-    });
+      createdAtMs: Date.now(),
+    };
+    this.events.unshift(ev);
     if (this.events.length > 24) this.events.length = 24;
+    this.pendingEvents.push(ev);
   }
+}
+
+function dist3(a: Vec3, b: Vec3): number {
+  return Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
 }

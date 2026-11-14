@@ -149,32 +149,47 @@ body,
   flex-wrap: wrap;
 }
 
-.speed-pill {
-  padding: 4px 6px;
-  gap: 3px;
+.live-pill {
+  padding: 6px 14px;
+  gap: 8px;
 }
 
-.icon-btn {
-  background: transparent;
-  border: none;
-  color: var(--text-muted);
+.live-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--accent-amber);
+  flex-shrink: 0;
+}
+
+.live-dot.live {
+  background: var(--accent-emerald);
+  box-shadow: 0 0 10px var(--accent-emerald);
+  animation: livePulse 2.2s ease-in-out infinite;
+}
+
+.live-dot.reconnecting {
+  background: var(--accent-coral);
+  box-shadow: 0 0 8px var(--accent-coral);
+}
+
+.live-text {
   font-size: 12px;
   font-weight: 600;
-  padding: 5px 10px;
-  border-radius: 999px;
-  cursor: pointer;
-  transition: all 0.18s ease;
-}
-
-.icon-btn:hover {
+  letter-spacing: 0.02em;
   color: var(--text-main);
-  background: rgba(255, 255, 255, 0.08);
+  white-space: nowrap;
 }
 
-.icon-btn.active {
-  background: rgba(243, 181, 82, 0.24);
-  color: #ffd791;
-  border: 1px solid rgba(243, 181, 82, 0.4);
+@keyframes livePulse {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.55;
+    transform: scale(0.85);
+  }
 }
 
 .glass-btn {

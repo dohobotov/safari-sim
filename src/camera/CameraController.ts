@@ -1,7 +1,9 @@
 import * as THREE from 'three';
-import { SPECIES_CONFIGS } from '../entities/SpeciesData';
-import type { Animal } from '../types';
-import { WORLD_HALF, getTerrainHeight } from '../world/TerrainMath';
+import type { RenderAnimal } from '../entities/AnimalMeshFactory.js';
+import { SPECIES_CONFIGS } from '../shared/SpeciesData.js';
+import { getTerrainHeight } from '../shared/TerrainMath.js';
+
+const CAMERA_CLAMP = 94;
 
 export class CameraController {
   public readonly target = new THREE.Vector3(-12, 1.5, -6);
@@ -9,7 +11,7 @@ export class CameraController {
   public autoDirector = false;
 
   private yaw = 0.65;
-  private pitch = 0.44; // radians above horizon
+  private pitch = 0.44;
   private distance = 44;
 
   private desiredTarget = new THREE.Vector3(-12, 1.5, -6);
@@ -29,14 +31,14 @@ export class CameraController {
 
   private readonly camera: THREE.PerspectiveCamera;
   private readonly dom: HTMLElement;
-  private onFollowChanged?: (animal: Animal | null) => void;
+  private onFollowChanged?: (animal: RenderAnimal | null) => void;
   private onDirectorChanged?: (active: boolean) => void;
 
   constructor(
     camera: THREE.PerspectiveCamera,
     dom: HTMLElement,
     callbacks?: {
-      onFollowChanged?: (animal: Animal | null) => void;
+      onFollowChanged?: (animal: RenderAnimal | null) => void;
       onDirectorChanged?: (active: boolean) => void;
     }
   ) {
@@ -52,7 +54,7 @@ export class CameraController {
     return this.dragMoved;
   }
 
-  public setAutoDirector(active: boolean, animals: Animal[] = []): void {
+  public setAutoDirector(active: boolean, animals: RenderAnimal[] = []): void {
     this.autoDirector = active;
     if (active) {
       this.directorTimer = 0;
@@ -61,7 +63,7 @@ export class CameraController {
     this.onDirectorChanged?.(this.autoDirector);
   }
 
-  public followAnimal(animal: Animal | null): void {
+  public followAnimal(animal: RenderAnimal | null): void {
     if (!animal) {
       this.followedAnimalId = null;
       this.onFollowChanged?.(null);
@@ -78,7 +80,8 @@ export class CameraController {
     this.followedAnimalId = null;
     this.onFollowChanged?.(null);
     this.desiredTarget.set(pos.x, getTerrainHeight(pos.x, pos.z) + 1.4, pos.z);
-    this.desiredDistance = Math.min(this.desiredDistance, 26);
+    this.clampDesiredTarget();
+    this.desiredDistance = Math.min(this.desiredDistance, 28);
   }
 
   private bindInput(): void {
@@ -112,8 +115,8 @@ export class CameraController {
         this.desiredYaw -= dx * 0.0065;
         this.desiredPitch = THREE.MathUtils.clamp(
           this.desiredPitch + dy * 0.0055,
-          0.11,
-          1.28
+          0.12,
+          1.25
         );
       } else if (this.isDraggingPan) {
         this.panByScreenDelta(dx, dy);
@@ -130,7 +133,7 @@ export class CameraController {
       (e) => {
         e.preventDefault();
         const factor = e.deltaY > 0 ? 1.12 : 0.89;
-        this.desiredDistance = THREE.MathUtils.clamp(this.desiredDistance * factor, 7, 135);
+        this.desiredDistance = THREE.MathUtils.clamp(this.desiredDistance * factor, 7, 88);
       },
       { passive: false }
     );
@@ -140,6 +143,11 @@ export class CameraController {
     });
     window.addEventListener('keyup', (e) => {
       this.keys.delete(e.code);
+    });
+    window.addEventListener('blur', () => {
+      this.keys.clear();
+      this.isDraggingOrbit = false;
+      this.isDraggingPan = false;
     });
   }
 
@@ -160,14 +168,13 @@ export class CameraController {
   }
 
   private clampDesiredTarget(): void {
-    this.desiredTarget.x = THREE.MathUtils.clamp(this.desiredTarget.x, -WORLD_HALF, WORLD_HALF);
-    this.desiredTarget.z = THREE.MathUtils.clamp(this.desiredTarget.z, -WORLD_HALF, WORLD_HALF);
+    this.desiredTarget.x = THREE.MathUtils.clamp(this.desiredTarget.x, -CAMERA_CLAMP, CAMERA_CLAMP);
+    this.desiredTarget.z = THREE.MathUtils.clamp(this.desiredTarget.z, -CAMERA_CLAMP, CAMERA_CLAMP);
     const groundY = getTerrainHeight(this.desiredTarget.x, this.desiredTarget.z);
     this.desiredTarget.y = Math.max(0.2, groundY + 1.4);
   }
 
-  public update(realDt: number, animals: Animal[]): void {
-    // Keyboard WASD / Arrows panning
+  public update(realDt: number, animals: RenderAnimal[]): void {
     const moveFwd =
       (this.keys.has('KeyW') || this.keys.has('ArrowUp') ? 1 : 0) -
       (this.keys.has('KeyS') || this.keys.has('ArrowDown') ? 1 : 0);
@@ -183,7 +190,7 @@ export class CameraController {
       if (this.autoDirector) {
         this.setAutoDirector(false);
       }
-      const panSpeed = (18 + this.distance * 0.55) * realDt;
+      const panSpeed = (20 + this.distance * 0.55) * realDt;
       const forwardX = -Math.sin(this.yaw);
       const forwardZ = -Math.cos(this.yaw);
       const rightX = Math.cos(this.yaw);
@@ -194,20 +201,17 @@ export class CameraController {
       this.clampDesiredTarget();
     }
 
-    // Auto-Director mode
     if (this.autoDirector && animals.length > 0) {
       this.directorTimer -= realDt;
       if (this.directorTimer <= 0) {
         this.directorTimer = 18 + Math.random() * 7;
         this.pickDirectorSubject(animals);
       }
-      // Slow cinematic orbit
       this.desiredYaw += realDt * 0.055;
     }
 
-    // Follow active animal if selected
     if (this.followedAnimalId !== null) {
-      const targetAnimal = animals.find((a) => a.id === this.followedAnimalId && a.alive) ?? null;
+      const targetAnimal = animals.find((a) => a.id === this.followedAnimalId) ?? null;
       if (targetAnimal) {
         const cfg = SPECIES_CONFIGS[targetAnimal.species];
         this.desiredTarget.set(
@@ -221,7 +225,6 @@ export class CameraController {
       }
     }
 
-    // Smooth exponential damping
     const dampT = 1 - Math.exp(-7.5 * realDt);
     this.target.lerp(this.desiredTarget, dampT);
     this.yaw += (this.desiredYaw - this.yaw) * dampT;
@@ -231,13 +234,12 @@ export class CameraController {
     this.applyCameraPosition();
   }
 
-  private pickDirectorSubject(animals: Animal[]): void {
-    let best: Animal | null = null;
+  private pickDirectorSubject(animals: RenderAnimal[]): void {
+    let best: RenderAnimal | null = null;
     let bestScore = -Infinity;
 
     for (let i = 0; i < animals.length; i++) {
       const a = animals[i];
-      if (!a.alive) continue;
       const cfg = SPECIES_CONFIGS[a.species];
       let score = cfg.isMainFive ? 18 : 4;
       if (a.state === 'chasing' || a.state === 'defending') score += 45;
@@ -245,6 +247,7 @@ export class CameraController {
       else if (a.state === 'crossing' || a.isSwimming) score += 26;
       else if (a.state === 'drinking' || a.state === 'browsing') score += 16;
       else if (a.state === 'feeding') score += 14;
+      else if (a.state === 'perching') score += 12;
       if (a.id === this.lastDirectorId) score -= 35;
       score += Math.random() * 10;
 

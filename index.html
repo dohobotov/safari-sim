@@ -40,14 +40,12 @@
           </div>
 
           <div class="controls-group">
-            <div class="glass-pill speed-pill" role="group" aria-label="Скорость времени">
-              <button class="icon-btn" data-speed="0" title="Пауза (Пробел)">⏸</button>
-              <button class="icon-btn active" data-speed="1" title="1x Созерцательный темп">1x</button>
-              <button class="icon-btn" data-speed="2" title="2x Ускоренный">2x</button>
-              <button class="icon-btn" data-speed="5" title="5x Быстрый">5x</button>
+            <div class="glass-pill live-pill" id="live-pill" title="Общий живой мир синхронизируется с сервером 24/7">
+              <span class="live-dot connecting" id="live-dot"></span>
+              <span class="live-text" id="live-text">Подключение...</span>
             </div>
 
-            <button class="glass-btn" id="director-btn" title="Авторежиссёр: камера сама находит интересные сцены (D)">
+            <button class="glass-btn" id="director-btn" title="Авторежиссёр: камера сама находит интересные сцены (C)">
               🎬 <span>Авторежиссёр</span>
             </button>
 
@@ -115,7 +113,7 @@
 
         <!-- Subtle Controls Hint (Bottom Center) -->
         <div class="controls-hint" id="controls-hint">
-          ЛКМ — вращение · ПКМ / WASD — перемещение · Колесо — зум · Клик по животному — следить
+          ЛКМ — вращение · ПКМ / WASD — перемещение · Колесо — зум · Клик по животному — следить · C — режиссёр · H — скрыть HUD
         </div>
       </div>
 

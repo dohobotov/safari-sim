@@ -1,4 +1,4 @@
-import type { Sex, SpeciesConfig, SpeciesId } from '../types';
+import type { AnimalState, LifeStage, Sex, SpeciesConfig, SpeciesId } from './types.js';
 
 export const SPECIES_CONFIGS: Record<SpeciesId, SpeciesConfig> = {
   elephant: {
@@ -249,7 +249,7 @@ export const SPECIES_CONFIGS: Record<SpeciesId, SpeciesConfig> = {
     maxCap: 10,
     nocturnal: false,
     crepuscular: false,
-    bioRu: 'Парит высоко в восходящих потоках воздуха, замечает добычу хищников издалека и очищает долину от падали.',
+    bioRu: 'Парит высоко в восходящих потоках воздуха, отдыхает на сухих деревьях и очищает долину от падали.',
   },
 };
 
@@ -266,6 +266,29 @@ export const SPECIES_ORDER: SpeciesId[] = [
   'vulture',
 ];
 
+export const STATE_ORDER: AnimalState[] = [
+  'wandering',
+  'grazing',
+  'browsing',
+  'seeking_water',
+  'drinking',
+  'cooling',
+  'resting',
+  'stalking',
+  'chasing',
+  'feeding',
+  'fleeing',
+  'defending',
+  'following',
+  'crossing',
+  'courting',
+  'soaring',
+  'scavenging',
+  'perching',
+];
+
+export const STAGE_ORDER: LifeStage[] = ['juvenile', 'adult', 'elder'];
+
 const NAMES_M: Record<SpeciesId, string[]> = {
   elephant: ['Тембо', 'Джумбо', 'Бату', 'Кобо', 'Тау', 'Муса'],
   lion: ['Аскар', 'Симба', 'Тау', 'Джабари', 'Багир', 'Нуру'],
@@ -276,7 +299,7 @@ const NAMES_M: Record<SpeciesId, string[]> = {
   antelope: ['Свифт', 'Спринг', 'Импи', 'Газель', 'Дарт'],
   deer: ['Аксис', 'Самбар', 'Бэмби', 'Лесник', 'Рогач'],
   boar: ['Пумба', 'Клык', 'Грохот', 'Вепрь', 'Борис'],
-  vulture: ['Кронос', 'Стервятник', 'Парус', 'Аквила', 'Тень'],
+  vulture: ['Кронос', 'Парус', 'Аквила', 'Тень', 'Коршун'],
 };
 
 const NAMES_F: Record<SpeciesId, string[]> = {
@@ -288,7 +311,7 @@ const NAMES_F: Record<SpeciesId, string[]> = {
   zebra: ['Зоя', 'Искра', 'Стрела', 'Веста', 'Нила'],
   antelope: ['Дэзи', 'Флора', 'Весна', 'Лада', 'Изида'],
   deer: ['Лань', 'Роса', 'Айла', 'Флора', 'Нора'],
-  boar: ['Хрюня', 'Марта', 'Лесная', 'Берта', 'Рысь'],
+  boar: ['Марта', 'Лесная', 'Берта', 'Ива', 'Рысь'],
   vulture: ['Сирена', 'Венера', 'Гера', 'Астра', 'Стрела'],
 };
 

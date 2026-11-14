@@ -1,6 +1,6 @@
 import type * as THREE from 'three';
-import type { SeasonState, SpeciesId, TimeState } from '../types';
-import { getRiverCenterX } from '../world/TerrainMath';
+import type { SeasonState, SpeciesId, TimeState } from '../shared/types.js';
+import { getRiverCenterX } from '../shared/TerrainMath.js';
 
 export class Soundscape {
   private ctx: AudioContext | null = null;

@@ -1,13 +1,14 @@
 import * as THREE from 'three';
+import type { RenderAnimal } from '../entities/AnimalMeshFactory.js';
+import type { ConnectionStatus } from '../net/WorldClient.js';
 import {
   SPECIES_CONFIGS,
   SPECIES_ORDER,
   getSpeciesTitleRu,
-} from '../entities/SpeciesData';
-import type { Animal, SeasonState, SpeciesId, TimeState, WorldEvent } from '../types';
+} from '../shared/SpeciesData.js';
+import type { SeasonState, SpeciesId, TimeState, WorldEvent } from '../shared/types.js';
 
 export interface HUDCallbacks {
-  onSpeedChange: (speed: number) => void;
   onToggleDirector: () => void;
   onToggleAudio: () => void;
   onCloseInspector: () => void;
@@ -28,9 +29,8 @@ export class HUD {
   private readonly dayCounterEl = document.getElementById('day-counter')!;
   private readonly speciesGridEl = document.getElementById('species-grid')!;
 
-  private readonly speedBtns = Array.from(
-    document.querySelectorAll<HTMLButtonElement>('.speed-pill .icon-btn')
-  );
+  private readonly liveDotEl = document.getElementById('live-dot')!;
+  private readonly liveTextEl = document.getElementById('live-text')!;
   private readonly directorBtn = document.getElementById('director-btn') as HTMLButtonElement;
   private readonly audioBtn = document.getElementById('audio-btn') as HTMLButtonElement;
   private readonly hideHudBtn = document.getElementById('hide-hud-btn') as HTMLButtonElement;
@@ -61,14 +61,6 @@ export class HUD {
   }
 
   private bindEvents(): void {
-    this.speedBtns.forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const spd = Number(btn.dataset.speed ?? '1');
-        this.setActiveSpeed(spd);
-        this.callbacks.onSpeedChange(spd);
-      });
-    });
-
     this.popToggleEl.addEventListener('click', () => {
       this.popDrawerEl.classList.toggle('hidden');
     });
@@ -88,7 +80,7 @@ export class HUD {
     window.addEventListener('keydown', (e) => {
       if (e.code === 'KeyH') {
         this.setCinemaMode(!this.cinemaHidden);
-      } else if (e.code === 'KeyD') {
+      } else if (e.code === 'KeyC') {
         this.callbacks.onToggleDirector();
       } else if (e.code === 'KeyM') {
         this.callbacks.onToggleAudio();
@@ -104,12 +96,6 @@ export class HUD {
     this.showHudBtn.classList.toggle('hidden', !hidden);
   }
 
-  public setActiveSpeed(speed: number): void {
-    this.speedBtns.forEach((b) => {
-      b.classList.toggle('active', Number(b.dataset.speed) === speed);
-    });
-  }
-
   public setDirectorActive(active: boolean): void {
     this.directorBtn.classList.toggle('active', active);
   }
@@ -123,10 +109,21 @@ export class HUD {
     time: TimeState,
     season: SeasonState,
     counts: Record<SpeciesId, number>,
-    followedAnimal: Animal | null,
+    followedAnimal: RenderAnimal | null,
     biomeRu: string,
-    events: WorldEvent[]
+    events: WorldEvent[],
+    viewerCount: number,
+    connectionStatus: ConnectionStatus
   ): void {
+    this.liveDotEl.className = `live-dot ${connectionStatus}`;
+    if (connectionStatus === 'live') {
+      this.liveTextEl.textContent = `LIVE · ${viewerCount} онлайн`;
+    } else if (connectionStatus === 'connecting') {
+      this.liveTextEl.textContent = 'Подключение...';
+    } else {
+      this.liveTextEl.textContent = 'Переподключение...';
+    }
+
     const hh = String(time.hour).padStart(2, '0');
     const mm = String(time.minute).padStart(2, '0');
     this.clockEl.textContent = `${hh}:${mm} · ${time.phaseNameRu}`;
@@ -141,7 +138,6 @@ export class HUD {
     this.weatherLabelEl.textContent = season.weatherTextRu;
     this.dayCounterEl.textContent = `День ${time.day}`;
 
-    // Total & species breakdown
     let total = 0;
     for (const sp of SPECIES_ORDER) total += counts[sp] ?? 0;
     this.popTotalEl.textContent = `🐾 ${total}`;
@@ -150,8 +146,7 @@ export class HUD {
       this.renderSpeciesDrawer(counts);
     }
 
-    // Inspector card
-    if (followedAnimal && followedAnimal.alive) {
+    if (followedAnimal) {
       this.inspectorCard.classList.remove('hidden');
       const cfg = SPECIES_CONFIGS[followedAnimal.species];
       const stageRu =
@@ -179,7 +174,6 @@ export class HUD {
       this.inspectorCard.classList.add('hidden');
     }
 
-    // Event Ticker
     this.syncEvents(events);
   }
 
@@ -200,18 +194,19 @@ export class HUD {
   }
 
   private syncEvents(events: WorldEvent[]): void {
-    const now = performance.now();
-    // Show newest unseen events (max 3 visible)
+    const now = Date.now();
     for (let i = Math.min(2, events.length - 1); i >= 0; i--) {
       const ev = events[i];
       if (this.shownEventIds.has(ev.id)) continue;
-      if (now - ev.createdAtReal > 10000) continue;
+      if (now - ev.createdAtMs > 12000) continue;
 
       this.shownEventIds.add(ev.id);
       const toast = document.createElement('div');
       toast.className = 'event-toast';
       toast.textContent = `${ev.icon} ${ev.text}`;
-      toast.addEventListener('click', () => this.callbacks.onEventClick(ev.pos));
+      toast.addEventListener('click', () =>
+        this.callbacks.onEventClick(new THREE.Vector3(ev.x, ev.y, ev.z))
+      );
 
       this.tickerEl.appendChild(toast);
       while (this.tickerEl.children.length > 3) {

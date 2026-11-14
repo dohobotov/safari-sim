@@ -1,12 +1,13 @@
 import * as THREE from 'three';
-import { Soundscape } from './audio/Soundscape';
-import { CameraController } from './camera/CameraController';
-import { Simulation } from './sim/Simulation';
-import { SPECIES_CONFIGS } from './entities/SpeciesData';
+import { Soundscape } from './audio/Soundscape.js';
+import { CameraController } from './camera/CameraController.js';
+import { WorldClient } from './net/WorldClient.js';
+import { SPECIES_CONFIGS } from './shared/SpeciesData.js';
+import { getWaterLevel } from './shared/TerrainMath.js';
 import './style.css';
-import { HUD } from './ui/HUD';
-import { Atmosphere } from './world/Atmosphere';
-import { WorldBuilder } from './world/WorldBuilder';
+import { HUD } from './ui/HUD.js';
+import { Atmosphere } from './world/Atmosphere.js';
+import { WorldBuilder } from './world/WorldBuilder.js';
 
 const canvas = document.getElementById('safari-canvas') as HTMLCanvasElement;
 
@@ -27,15 +28,14 @@ const camera = new THREE.PerspectiveCamera(
   50,
   window.innerWidth / window.innerHeight,
   0.5,
-  450
+  1400
 );
 
 const world = new WorldBuilder(scene);
 const atmosphere = new Atmosphere(scene);
 const soundscape = new Soundscape();
-const simulation = new Simulation(scene, world.trees, world.kopjes, atmosphere, soundscape);
+const worldClient = new WorldClient(scene, atmosphere, soundscape);
 
-// Subtle glowing ring on the ground under the currently followed animal
 const selectRing = new THREE.Mesh(
   new THREE.RingGeometry(0.95, 1.18, 28),
   new THREE.MeshBasicMaterial({
@@ -50,20 +50,13 @@ selectRing.rotation.x = -Math.PI / 2;
 selectRing.visible = false;
 scene.add(selectRing);
 
-let timeSpeed = 1;
-let lastNonZeroSpeed = 1;
-
 const cameraController = new CameraController(camera, canvas, {
   onDirectorChanged: (active) => hud.setDirectorActive(active),
 });
 
 const hud = new HUD({
-  onSpeedChange: (spd) => {
-    timeSpeed = spd;
-    if (spd > 0) lastNonZeroSpeed = spd;
-  },
   onToggleDirector: () => {
-    cameraController.setAutoDirector(!cameraController.autoDirector, simulation.animals);
+    cameraController.setAutoDirector(!cameraController.autoDirector, worldClient.animals);
   },
   onToggleAudio: () => {
     const enabled = soundscape.toggle();
@@ -77,7 +70,7 @@ const hud = new HUD({
     cameraController.jumpToPoint(pos);
   },
   onSpeciesPick: (species) => {
-    const candidates = simulation.animals.filter((a) => a.alive && a.species === species);
+    const candidates = worldClient.animals.filter((a) => a.species === species);
     if (candidates.length > 0) {
       const idx = Math.floor(Math.random() * candidates.length);
       cameraController.setAutoDirector(false);
@@ -86,16 +79,6 @@ const hud = new HUD({
   },
 });
 
-// Spacebar Pause / Resume toggle
-window.addEventListener('keydown', (e) => {
-  if (e.code === 'Space') {
-    e.preventDefault();
-    timeSpeed = timeSpeed === 0 ? lastNonZeroSpeed : 0;
-    hud.setActiveSpeed(timeSpeed);
-  }
-});
-
-// Raycasting to select any 3D animal on click
 const raycaster = new THREE.Raycaster();
 const pointerNDC = new THREE.Vector2();
 
@@ -106,12 +89,12 @@ canvas.addEventListener('pointerup', (e) => {
   pointerNDC.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
 
   raycaster.setFromCamera(pointerNDC, camera);
-  const roots = simulation.animals.map((a) => a.rig.root);
+  const roots = worldClient.animals.map((a) => a.rig.root);
   const hits = raycaster.intersectObjects(roots, true);
 
   if (hits.length > 0) {
     const id = hits[0].object.userData.animalId as number | undefined;
-    const hitAnimal = simulation.getAnimalById(id ?? null);
+    const hitAnimal = worldClient.getAnimalById(id ?? null);
     if (hitAnimal) {
       cameraController.setAutoDirector(false);
       cameraController.followAnimal(hitAnimal);
@@ -127,7 +110,6 @@ window.addEventListener('resize', () => {
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
-// Render & Simulation Loop
 let prevTime = performance.now();
 let hudThrottle = 0;
 
@@ -137,14 +119,16 @@ function animate(now: number): void {
   prevTime = now;
   const realTimeSec = now / 1000;
 
-  simulation.setCameraTarget(cameraController.target);
-  simulation.step(realDt, timeSpeed, realTimeSec);
+  worldClient.setCameraTarget(cameraController.target);
+  worldClient.update(realDt, realTimeSec);
 
-  cameraController.update(realDt, simulation.animals);
+  cameraController.update(realDt, worldClient.animals);
 
-  const followedNow = simulation.getAnimalById(cameraController.followedAnimalId);
+  const followedNow = worldClient.getAnimalById(cameraController.followedAnimalId);
   if (followedNow) {
-    const r = SPECIES_CONFIGS[followedNow.species].adultRadius * (followedNow.stage === 'juvenile' ? 0.65 : 1.15);
+    const r =
+      SPECIES_CONFIGS[followedNow.species].adultRadius *
+      (followedNow.stage === 'juvenile' ? 0.65 : 1.15);
     const pulse = 1 + Math.sin(realTimeSec * 4) * 0.06;
     selectRing.visible = true;
     selectRing.position.set(followedNow.pos.x, followedNow.pos.y + 0.14, followedNow.pos.z);
@@ -153,22 +137,24 @@ function animate(now: number): void {
     selectRing.visible = false;
   }
 
-  world.updateSeasonVisuals(simulation.season.wetness, simulation.season.rainIntensity);
-  const windStrength = simulation.season.isRaining ? 0.85 : 0.28;
-  world.animateEnvironment(realTimeSec, windStrength);
+  world.updateSeasonVisuals(worldClient.season.wetness, worldClient.season.rainIntensity);
+  const windStrength = worldClient.season.isRaining ? 0.85 : 0.28;
+  const waterY = getWaterLevel(worldClient.season.wetness);
+  world.animateEnvironment(realTimeSec, windStrength, waterY);
 
   atmosphere.update(
-    simulation.timeState,
-    simulation.season,
+    worldClient.timeState,
+    worldClient.season,
     cameraController.target,
+    camera.position,
     realDt,
     realTimeSec
   );
 
   soundscape.update(
     realDt,
-    simulation.timeState,
-    simulation.season,
+    worldClient.timeState,
+    worldClient.season,
     camera.position,
     cameraController.target
   );
@@ -178,15 +164,17 @@ function animate(now: number): void {
   hudThrottle += realDt;
   if (hudThrottle >= 0.14) {
     hudThrottle = 0;
-    const followed = simulation.getAnimalById(cameraController.followedAnimalId);
-    const biomeRu = followed ? simulation.getCurrentBiomeRu(followed) : '';
+    const followed = worldClient.getAnimalById(cameraController.followedAnimalId);
+    const biomeRu = followed ? worldClient.getCurrentBiomeRu(followed) : '';
     hud.update(
-      simulation.timeState,
-      simulation.season,
-      simulation.getSpeciesCounts(),
+      worldClient.timeState,
+      worldClient.season,
+      worldClient.getSpeciesCounts(),
       followed,
       biomeRu,
-      simulation.events
+      worldClient.events,
+      worldClient.viewerCount,
+      worldClient.connectionStatus
     );
   }
 }
